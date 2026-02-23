@@ -11,7 +11,14 @@ import torch.nn as nn
 
 from vmas import make_env
 
-from VMAS.scenarios.triangle_fill import Scenario
+try:
+    # Run-friendly import when executing from the repo root.
+    # 从仓库根目录直接运行脚本时使用的导入方式。
+    from scenarios.triangle_fill import Scenario
+except ImportError:  # pragma: no cover
+    # Package-style import fallback.
+    # 包形式导入的兜底写法。
+    from VMAS.scenarios.triangle_fill import Scenario
 
 
 class Actor(nn.Module):
@@ -47,20 +54,22 @@ def _scenario_kwargs_from_ckpt(ckpt: Dict[str, Any], overrides: argparse.Namespa
 
     ckpt_args = ckpt.get("args", {}) or {}
     n_agents = int(ckpt_args.get("n_agents", 30))
-    w_cover = float(ckpt_args.get("w_cover", 0.0))
 
-    scenario_kwargs: Dict[str, Any] = {"n_agents": n_agents, "w_cover": w_cover}
+    scenario_kwargs: Dict[str, Any] = {"n_agents": n_agents}
     for key in [
         "pile_center_mm",
+        "pile_center_y_mm_range",
         "pile_halfwidth_mm",
-        "w_in",
-        "w_out",
-        "w_action",
-        "w_collision",
-        "w_depth",
-        "depth_scale_mm",
+        "obs_top_k_neighbors",
         "turn_v_frac",
         "normalize_obs",
+        "formation_w",
+        "formation_sinkhorn_tau",
+        "formation_sinkhorn_iters",
+        "formation_eps",
+        "formation_template_seed",
+        "safe_collision_w",
+        "safe_action_w",
     ]:
         v = ckpt_args.get(key, None)
         if v is not None:
@@ -93,12 +102,22 @@ def _scenario_kwargs_from_ckpt(ckpt: Dict[str, Any], overrides: argparse.Namespa
         scenario_kwargs["pile_center_mm"] = (float(overrides.pile_center_x_mm or 0.0), float(overrides.pile_center_y_mm or 0.0))
     if overrides.pile_halfwidth_mm is not None:
         scenario_kwargs["pile_halfwidth_mm"] = float(overrides.pile_halfwidth_mm)
-    if overrides.w_action is not None:
-        scenario_kwargs["w_action"] = float(overrides.w_action)
-    if overrides.w_collision is not None:
-        scenario_kwargs["w_collision"] = float(overrides.w_collision)
     if overrides.normalize_obs is not None:
         scenario_kwargs["normalize_obs"] = bool(overrides.normalize_obs)
+    if overrides.formation_w is not None:
+        scenario_kwargs["formation_w"] = float(overrides.formation_w)
+    if overrides.formation_sinkhorn_tau is not None:
+        scenario_kwargs["formation_sinkhorn_tau"] = float(overrides.formation_sinkhorn_tau)
+    if overrides.formation_sinkhorn_iters is not None:
+        scenario_kwargs["formation_sinkhorn_iters"] = int(overrides.formation_sinkhorn_iters)
+    if overrides.formation_eps is not None:
+        scenario_kwargs["formation_eps"] = float(overrides.formation_eps)
+    if overrides.formation_template_seed is not None:
+        scenario_kwargs["formation_template_seed"] = int(overrides.formation_template_seed)
+    if overrides.safe_collision_w is not None:
+        scenario_kwargs["safe_collision_w"] = float(overrides.safe_collision_w)
+    if overrides.safe_action_w is not None:
+        scenario_kwargs["safe_action_w"] = float(overrides.safe_action_w)
 
     obs_dim_expected = _infer_obs_dim_expected(ckpt)
     if obs_dim_expected is not None:
@@ -124,9 +143,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pile-center-y-mm-min", type=float, default=None)
     p.add_argument("--pile-center-y-mm-max", type=float, default=None)
     p.add_argument("--pile-halfwidth-mm", type=float, default=None)
-    p.add_argument("--w-action", type=float, default=None)
-    p.add_argument("--w-collision", type=float, default=None)
     p.add_argument("--normalize-obs", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--formation-w", type=float, default=None)
+    p.add_argument("--formation-sinkhorn-tau", type=float, default=None)
+    p.add_argument("--formation-sinkhorn-iters", type=int, default=None)
+    p.add_argument("--formation-eps", type=float, default=None)
+    p.add_argument("--formation-template-seed", type=int, default=None)
+    p.add_argument("--safe-collision-w", type=float, default=None)
+    p.add_argument("--safe-action-w", type=float, default=None)
     p.add_argument("--debug-scenario", action="store_true", help="Print scenario kwargs and resolved values.")
     return p.parse_args()
 
@@ -179,12 +203,13 @@ def main() -> None:
             "comm_r": float(getattr(s, "comm_r", float("nan"))),
             "v0": float(getattr(s, "v0", float("nan"))),
             "turn_v_frac": getattr(s, "turn_v_frac", None),
-            "pile_center_mm": getattr(s, "pile_center_mm", None),
-            "pile_halfwidth_mm": getattr(s, "pile_halfwidth_mm", None),
-            "obs_dim": int(obs_dim),
-            "deterministic": bool(args.deterministic),
-            "max_episode_steps": int(args.max_episode_steps),
-        }
+                "pile_center_mm": getattr(s, "pile_center_mm", None),
+                "pile_halfwidth_mm": getattr(s, "pile_halfwidth_mm", None),
+                "obs_dim": int(obs_dim),
+                "task_mode": "formation",
+                "deterministic": bool(args.deterministic),
+                "max_episode_steps": int(args.max_episode_steps),
+            }
         print("DEBUG scenario_resolved:", json.dumps(resolved, indent=2, default=str))
         sys.stdout.flush()
 
@@ -222,13 +247,12 @@ def main() -> None:
             step += 1
             if args.print_every and step % int(args.print_every) == 0:
                 info0 = infos[0] if infos else {}
-                inside = info0.get("inside_frac", None)
-                outside = info0.get("outside_mean", None)
-                print(
-                    f"step={step:6d} "
-                    f"inside_frac={inside.float().mean().item():.3f} " if isinstance(inside, torch.Tensor) else f"step={step:6d} "
-                    + (f"outside_mean={outside.float().mean().item():.3f} " if isinstance(outside, torch.Tensor) else "")
-                )
+                parts = [f"step={step:6d}"]
+                for key in ("formation_score", "formation_loss", "collision_mean", "action_mean"):
+                    v = info0.get(key, None)
+                    if isinstance(v, torch.Tensor) and v.numel() > 0:
+                        parts.append(f"{key}={v.float().mean().item():.3f}")
+                print(" ".join(parts))
 
             if args.realtime and dt > 0:
                 time.sleep(dt)

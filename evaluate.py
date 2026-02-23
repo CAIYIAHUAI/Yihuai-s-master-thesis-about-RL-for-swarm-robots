@@ -12,7 +12,14 @@ import torch.nn as nn
 from vmas import make_env
 from vmas.simulator.utils import save_video
 
-from VMAS.scenarios.triangle_fill import Scenario
+try:
+    # Run-friendly import when executing from the repo root.
+    # 从仓库根目录直接运行脚本时使用的导入方式。
+    from scenarios.triangle_fill import Scenario
+except ImportError:  # pragma: no cover
+    # Package-style import fallback.
+    # 包形式导入的兜底写法。
+    from VMAS.scenarios.triangle_fill import Scenario
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,12 +64,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pile-center-y-mm-min", type=float, default=None)
     p.add_argument("--pile-center-y-mm-max", type=float, default=None)
     p.add_argument("--pile-halfwidth-mm", type=float, default=None)
-    p.add_argument("--w-in", type=float, default=None)
-    p.add_argument("--w-out", type=float, default=None)
-    p.add_argument("--w-action", type=float, default=None)
-    p.add_argument("--w-collision", type=float, default=None)
-    p.add_argument("--w-depth", type=float, default=None)
-    p.add_argument("--depth-scale-mm", type=float, default=None)
     p.add_argument("--turn-v-frac", type=float, default=None)
     p.add_argument(
         "--normalize-obs",
@@ -70,6 +71,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override scenario observation normalization (default: checkpoint/scenario setting).",
     )
+    p.add_argument("--formation-w", type=float, default=None)
+    p.add_argument("--formation-sinkhorn-tau", type=float, default=None)
+    p.add_argument("--formation-sinkhorn-iters", type=int, default=None)
+    p.add_argument("--formation-eps", type=float, default=None)
+    p.add_argument("--formation-template-seed", type=int, default=None)
+    p.add_argument("--safe-collision-w", type=float, default=None)
+    p.add_argument("--safe-action-w", type=float, default=None)
     return p.parse_args()
 
 
@@ -88,13 +96,8 @@ class Actor(nn.Module):
         return self.net(obs)
 
 
-def _mean_metrics(info0: dict) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    for k in ["inside_frac", "outside_mean", "collisions_mean", "cover_error", "speed_mean"]:
-        v = info0.get(k, None)
-        if isinstance(v, torch.Tensor) and v.numel() > 0:
-            out[k] = v.float().mean().item()
-    return out
+def metric_keys_for_eval() -> List[str]:
+    return ["formation_loss", "formation_score", "collision_mean", "action_mean", "sinkhorn_entropy", "speed_mean"]
 
 
 def _stack_metric(info0: dict, key: str) -> Optional[torch.Tensor]:
@@ -133,9 +136,6 @@ def main() -> None:
         if isinstance(w, torch.Tensor) and w.ndim == 2:
             obs_dim_expected = int(w.shape[1])
 
-    # For evaluation we keep w_cover from checkpoint args if present; cover_error is computed regardless.
-    w_cover = float(ckpt_args.get("w_cover", 0.0))
-
     # Keep evaluation horizon consistent with training unless explicitly overridden.
     if args.max_episode_steps is None:
         args.max_episode_steps = int(ckpt_args.get("max_episode_steps", 500))
@@ -146,19 +146,21 @@ def main() -> None:
 
     # Reuse training scenario config from checkpoint by default (for scientific reproducibility).
     # You can override any field via CLI flags for domain-shift evaluation.
-    scenario_kwargs = {"n_agents": n_agents, "w_cover": w_cover}
+    scenario_kwargs = {"n_agents": n_agents}
     for key in [
         "pile_center_mm",
         "pile_center_y_mm_range",
         "pile_halfwidth_mm",
-        "w_in",
-        "w_out",
-        "w_action",
-        "w_collision",
-        "w_depth",
-        "depth_scale_mm",
+        "obs_top_k_neighbors",
         "turn_v_frac",
         "normalize_obs",
+        "formation_w",
+        "formation_sinkhorn_tau",
+        "formation_sinkhorn_iters",
+        "formation_eps",
+        "formation_template_seed",
+        "safe_collision_w",
+        "safe_action_w",
     ]:
         v = ckpt_args.get(key, None)
         if v is not None:
@@ -198,27 +200,31 @@ def main() -> None:
         )
     if args.pile_halfwidth_mm is not None:
         scenario_kwargs["pile_halfwidth_mm"] = float(args.pile_halfwidth_mm)
-    if args.w_in is not None:
-        scenario_kwargs["w_in"] = float(args.w_in)
-    if args.w_out is not None:
-        scenario_kwargs["w_out"] = float(args.w_out)
-    if args.w_action is not None:
-        scenario_kwargs["w_action"] = float(args.w_action)
-    if args.w_collision is not None:
-        scenario_kwargs["w_collision"] = float(args.w_collision)
-    if args.w_depth is not None:
-        scenario_kwargs["w_depth"] = float(args.w_depth)
-    if args.depth_scale_mm is not None:
-        scenario_kwargs["depth_scale_mm"] = float(args.depth_scale_mm)
     if args.turn_v_frac is not None:
         scenario_kwargs["turn_v_frac"] = float(args.turn_v_frac)
     if args.normalize_obs is not None:
         scenario_kwargs["normalize_obs"] = bool(args.normalize_obs)
+    if args.formation_w is not None:
+        scenario_kwargs["formation_w"] = float(args.formation_w)
+    if args.formation_sinkhorn_tau is not None:
+        scenario_kwargs["formation_sinkhorn_tau"] = float(args.formation_sinkhorn_tau)
+    if args.formation_sinkhorn_iters is not None:
+        scenario_kwargs["formation_sinkhorn_iters"] = int(args.formation_sinkhorn_iters)
+    if args.formation_eps is not None:
+        scenario_kwargs["formation_eps"] = float(args.formation_eps)
+    if args.formation_template_seed is not None:
+        scenario_kwargs["formation_template_seed"] = int(args.formation_template_seed)
+    if args.safe_collision_w is not None:
+        scenario_kwargs["safe_collision_w"] = float(args.safe_collision_w)
+    if args.safe_action_w is not None:
+        scenario_kwargs["safe_action_w"] = float(args.safe_action_w)
 
     # Backward-compat: if the checkpoint expects a larger obs_dim than the current scenario outputs,
     # ask the scenario to pad observations with zeros so the Actor can run.
     if obs_dim_expected is not None:
         scenario_kwargs["obs_pad_to_dim"] = int(obs_dim_expected)
+
+    metric_keys = metric_keys_for_eval()
 
     env = make_env(
         scenario=Scenario(),
@@ -247,6 +253,7 @@ def main() -> None:
             "pile_halfwidth_mm": getattr(s, "pile_halfwidth_mm", None),
             "obs_dim_expected": obs_dim_expected,
             "obs_dim_runtime": int(obs_dim),
+            "task_mode": "formation",
             "metric_mode": args.metric_mode,
             "deterministic": args.deterministic,
             "max_episode_steps": int(args.max_episode_steps),
@@ -260,11 +267,7 @@ def main() -> None:
     actor.eval()
 
     episodes_done = 0
-    inside_all: List[torch.Tensor] = []
-    outside_all: List[torch.Tensor] = []
-    collisions_all: List[torch.Tensor] = []
-    cover_all: List[torch.Tensor] = []
-    speed_all: List[torch.Tensor] = []
+    metric_values: Dict[str, List[torch.Tensor]] = {k: [] for k in metric_keys}
     reward_all: List[torch.Tensor] = []
 
     frames: Optional[List] = [] if (args.render and args.save_video) else None
@@ -278,10 +281,9 @@ def main() -> None:
         ep_return = torch.zeros((batch_envs,), device=env.device)
 
         # Aggregate per-step metrics to avoid the "last frame only" pitfall and match training logs when needed.
-        keys = ["inside_frac", "outside_mean", "collisions_mean", "cover_error", "speed_mean"]
-        last = {k: torch.zeros((batch_envs,), device=env.device) for k in keys}
-        maxv = {k: torch.full((batch_envs,), -float("inf"), device=env.device) for k in keys}
-        sumv = {k: torch.zeros((batch_envs,), device=env.device) for k in keys}
+        last = {k: torch.zeros((batch_envs,), device=env.device) for k in metric_keys}
+        maxv = {k: torch.full((batch_envs,), -float("inf"), device=env.device) for k in metric_keys}
+        sumv = {k: torch.zeros((batch_envs,), device=env.device) for k in metric_keys}
         steps = 0
 
         for _t in range(args.max_episode_steps):
@@ -301,7 +303,7 @@ def main() -> None:
             info0 = infos[0]
             steps += 1
 
-            for k in keys:
+            for k in metric_keys:
                 v = _stack_metric(info0, k)
                 if v is None:
                     v = torch.zeros((batch_envs,), device=env.device)
@@ -327,37 +329,28 @@ def main() -> None:
         elif args.metric_mode == "max":
             final = maxv
         else:
-            final = {k: (sumv[k] / float(steps)) for k in keys}
+            final = {k: (sumv[k] / float(steps)) for k in metric_keys}
 
-        inside_all.append(final["inside_frac"][:active].cpu())
-        outside_all.append(final["outside_mean"][:active].cpu())
-        collisions_all.append(final["collisions_mean"][:active].cpu())
-        cover_all.append(final["cover_error"][:active].cpu())
-        speed_all.append(final["speed_mean"][:active].cpu())
+        for k in metric_keys:
+            metric_values[k].append(final[k][:active].cpu())
         reward_all.append(ep_return[:active].cpu())
 
         episodes_done += active
 
-    inside = torch.cat(inside_all, dim=0)
-    outside = torch.cat(outside_all, dim=0)
-    collisions = torch.cat(collisions_all, dim=0)
-    cover = torch.cat(cover_all, dim=0)
-    speed = torch.cat(speed_all, dim=0)
+    aggregated_metrics = {k: torch.cat(v, dim=0) for k, v in metric_values.items()}
     ep_ret = torch.cat(reward_all, dim=0)
 
     summary = {
         "episodes": int(args.episodes),
         "seed": int(args.seed),
         "deterministic": bool(args.deterministic),
+        "task_mode": "formation",
         "metric_mode": str(args.metric_mode),
         "checkpoint": str(ckpt_path),
-        "inside_frac": summarize(inside),
-        "outside_mean": summarize(outside),
-        "collisions_mean": summarize(collisions),
-        "cover_error": summarize(cover),
-        "speed_mean": summarize(speed),
         "episode_return": summarize(ep_ret),
     }
+    for k in metric_keys:
+        summary[k] = summarize(aggregated_metrics[k])
 
     print(json.dumps(summary, indent=2))
 

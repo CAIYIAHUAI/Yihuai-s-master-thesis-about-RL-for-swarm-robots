@@ -8,7 +8,14 @@ import torch
 from vmas import make_env
 from vmas.simulator.utils import save_video
 
-from VMAS.scenarios.triangle_fill import Scenario
+try:
+    # Run-friendly import when executing from the repo root.
+    # 从仓库根目录直接运行脚本时使用的导入方式。
+    from scenarios.triangle_fill import Scenario
+except ImportError:  # pragma: no cover
+    # Package-style import fallback.
+    # 包形式导入的兜底写法。
+    from VMAS.scenarios.triangle_fill import Scenario
 
 
 def _parse_args() -> argparse.Namespace:
@@ -34,7 +41,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _mean_metrics(info0: dict) -> str:
-    keys = ["inside_frac", "outside_mean", "collisions_mean", "cover_error"]
+    keys = ["formation_loss", "formation_score", "collision_mean", "action_mean", "sinkhorn_entropy", "speed_mean"]
     parts = []
     for k in keys:
         v = info0.get(k, None)
