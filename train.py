@@ -102,6 +102,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--formation-template-seed", type=int, default=0)
     p.add_argument("--target-spacing-mm", type=float, default=45.0, help="Target nearest-neighbor distance in mm.")
     p.add_argument("--spacing-w", type=float, default=1.0)
+    p.add_argument(
+        "--per-agent-reward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use per-agent reward decomposition instead of a shared global reward.",
+    )
     p.add_argument("--progress-reward", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
         "--success-bonus",
@@ -255,9 +261,9 @@ def compute_gae(
     lam: float,
     trunc_values: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    t, b = rewards.shape
-    adv = torch.zeros((t, b), device=rewards.device)
-    lastgaelam = torch.zeros((b,), device=rewards.device)
+    t, b = rewards.shape[:2]
+    adv = torch.zeros_like(rewards)
+    lastgaelam = torch.zeros_like(last_value)
 
     for step in reversed(range(t)):
         nextnonterminal = (~dones[step]).float()
@@ -410,6 +416,7 @@ def main() -> None:
         "formation_template_seed": int(args.formation_template_seed),
         "target_spacing_mm": float(args.target_spacing_mm),
         "spacing_w": float(args.spacing_w),
+        "share_reward": not bool(args.per_agent_reward),
         "progress_reward": bool(args.progress_reward),
         "success_bonus": float(args.success_bonus),
         "success_threshold": float(args.success_threshold),
@@ -572,7 +579,7 @@ def main() -> None:
         obs_buf = torch.zeros((T, B, n_agents, obs_dim), device=env.device)
         act_buf = torch.zeros((T, B, n_agents), device=env.device, dtype=torch.long)
         logp_buf = torch.zeros((T, B, n_agents), device=env.device)
-        rew_buf = torch.zeros((T, B), device=env.device)
+        rew_buf = torch.zeros((T, B, n_agents), device=env.device)
         done_buf = torch.zeros((T, B), device=env.device, dtype=torch.bool)
         val_buf = torch.zeros((T, B), device=env.device)
         trunc_val_buf = torch.zeros((T, B), device=env.device)
@@ -616,7 +623,7 @@ def main() -> None:
                 actions_for_env = [a[:, i].unsqueeze(-1) for i in range(n_agents)]
 
             obs_list, rews, dones, infos = env.step(actions_for_env)
-            rew_buf[t] = rews[0]
+            rew_buf[t] = torch.stack(rews, dim=1)
             done_buf[t] = dones
 
             if torch.any(dones):
@@ -634,19 +641,32 @@ def main() -> None:
         with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast):
             feat_last, lrms_last = build_critic_input(env.agents, scenario.v0)
             last_value = critic(feat_last, lrms_last)
-            adv, ret = compute_gae(rew_buf, done_buf, val_buf, last_value, args.gamma, args.gae_lambda, trunc_values=trunc_val_buf)
+            val_buf_n = val_buf.unsqueeze(-1).expand(T, B, n_agents)
+            last_value_n = last_value.unsqueeze(-1).expand(B, n_agents)
+            trunc_val_buf_n = trunc_val_buf.unsqueeze(-1).expand(T, B, n_agents)
+            done_buf_n = done_buf.unsqueeze(-1).expand(T, B, n_agents)
+            adv, ret = compute_gae(
+                rew_buf,
+                done_buf_n,
+                val_buf_n,
+                last_value_n,
+                args.gamma,
+                args.gae_lambda,
+                trunc_values=trunc_val_buf_n,
+            )
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         # Flatten policy batch: (T,B,N)
         obs_flat = obs_buf.reshape(T * B * n_agents, obs_dim)
         act_flat = act_buf.reshape(T * B * n_agents)
         old_logp_flat = logp_buf.reshape(T * B * n_agents)
-        adv_flat = adv.unsqueeze(-1).expand(T, B, n_agents).reshape(T * B * n_agents)  # shared-return -> same advantage for all agents
+        adv_flat = adv.reshape(T * B * n_agents)
 
         # Flatten value batch: (T,B)
         global_feat_flat = feat_buf.reshape(T * B, n_agents, 5)
         global_lrms_flat = lrms_buf.reshape(T * B)
-        ret_flat = ret.reshape(T * B)
+        ret_for_critic = ret.mean(dim=-1)
+        ret_flat = ret_for_critic.reshape(T * B)
         old_val_flat = val_buf.reshape(T * B)
 
         batch_policy = obs_flat.shape[0]

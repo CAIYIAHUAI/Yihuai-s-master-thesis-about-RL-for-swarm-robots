@@ -1,0 +1,52 @@
+# Triangle Fill v8 - Per-agent reward decomposition
+# Key change vs v7: per-agent-reward=true (row-wise credit assignment)
+device: cuda
+num-envs: 128
+n-agents: 30
+max-episode-steps: 1000
+
+rollout-steps: 512
+total-updates: 4000
+
+actor-hidden: 256
+critic-hidden: 512
+
+lr-actor: 3e-4
+lr-critic: 3e-4
+lr-end-factor: 0.1
+gamma: 0.99
+gae-lambda: 0.95
+clip-coef: 0.2
+update-epochs: 4
+minibatch-size-policy: 2048
+minibatch-size-value: 2048
+value-clip: 0.2
+max-grad-norm: 0.5
+
+ent-coef: 0.02
+ent-coef-end: 0.002
+ent-decay-updates: 3000
+
+# Per-agent reward (core change)
+per-agent-reward: true
+
+# Reward weights
+formation-w: 5.0
+spacing-w: 1.0
+target-spacing-mm: 45.0
+progress-reward: false
+success-bonus: 0.0
+success-threshold: 0.05
+safe-collision-w: 0.5
+safe-action-w: 0.02
+
+formation-sinkhorn-tau: 0.001
+formation-sinkhorn-iters: 100
+
+amp: false
+seed: 42
+
+log-every: 10
+save-every: 200
+tensorboard: true
+out-dir: runs/triangle_fill_v8
