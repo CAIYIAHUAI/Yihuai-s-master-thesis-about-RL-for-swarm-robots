@@ -8,18 +8,33 @@ from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 
 from vmas import make_env
 from scenarios.triangle_fill import Scenario
 
 
 def parse_args() -> argparse.Namespace:
+    # Pre-parse: check for --config before building the full parser.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None, help="Path to YAML config file")
+    pre_args, remaining = pre.parse_known_args()
+
+    config_defaults = {}
+    if pre_args.config is not None:
+        import yaml
+        with open(pre_args.config, "r") as f:
+            config_defaults = yaml.safe_load(f) or {}
+        # Convert YAML keys from kebab-case to underscore (argparse stores as underscore)
+        config_defaults = {k.replace("-", "_"): v for k, v in config_defaults.items()}
+
     p = argparse.ArgumentParser(
         description=(
             "MAPPO-style PPO training for VMAS triangle_fill (shared actor, centralized critic). "
             "All tensors stay on the chosen device; no numpy/CPU buffer conversions."
         )
     )
+    p.add_argument("--config", default=None, help="Path to YAML config file")
 
     # Core
     p.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
@@ -66,13 +81,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--minibatch-size-policy", type=int, default=2048)
     p.add_argument("--minibatch-size-value", type=int, default=2048)
     p.add_argument("--value-clip", type=float, default=0.2)
+    p.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable mixed-precision (AMP). Off by default — PPO actor gradients are sensitive to fp16.",
+    )
+    p.add_argument(
+        "--lr-end-factor",
+        type=float,
+        default=0.1,
+        help="Cosine-decay LR to lr * lr_end_factor over training. Set to 1.0 to disable decay.",
+    )
 
     # Task config
     p.add_argument("--formation-w", type=float, default=1.0)
-    p.add_argument("--formation-sinkhorn-tau", type=float, default=0.1)
-    p.add_argument("--formation-sinkhorn-iters", type=int, default=20)
+    p.add_argument("--formation-sinkhorn-tau", type=float, default=0.001)
+    p.add_argument("--formation-sinkhorn-iters", type=int, default=100)
     p.add_argument("--formation-eps", type=float, default=1e-8)
     p.add_argument("--formation-template-seed", type=int, default=0)
+    p.add_argument("--target-spacing-mm", type=float, default=45.0, help="Target nearest-neighbor distance in mm.")
+    p.add_argument("--spacing-w", type=float, default=1.0)
+    p.add_argument("--progress-reward", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--success-bonus",
+        type=float,
+        default=0.05,
+        help="Per-step settle bonus when formation_loss < success_threshold.",
+    )
+    p.add_argument("--success-threshold", type=float, default=0.05)
     p.add_argument("--safe-collision-w", type=float, default=0.5)
     p.add_argument("--safe-action-w", type=float, default=0.02)
     # Environment/scenario knobs (for scientific ablations; passed into Scenario.make_world via make_env kwargs).
@@ -96,6 +133,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override Top-K neighbor count in observation (default: scenario setting).",
     )
+    p.add_argument(
+        "--obs-include-goal-rel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include goal-relative observation (position relative to formation center).",
+    )
 
     # Resume
     p.add_argument("--resume", default=None, help="Path to checkpoint .pt to resume from")
@@ -118,6 +161,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--out-dir", default="/home/user/Yihuai/Code/VMAS/runs/triangle_fill")
+    p.add_argument("--tensorboard", action="store_true", help="Enable TensorBoard logging")
+
+    # Apply config file defaults (CLI args still override)
+    if config_defaults:
+        p.set_defaults(**config_defaults)
 
     return p.parse_args()
 
@@ -138,32 +186,51 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, global_dim: int, hidden: int):
+    """CTDE critic: DeepSets over per-agent state + global scale."""
+
+    def __init__(self, per_agent_dim: int, hidden: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(global_dim, hidden),
+        self.phi = nn.Sequential(
+            nn.Linear(per_agent_dim, hidden // 2),
+            nn.Tanh(),
+            nn.Linear(hidden // 2, hidden // 2),
+            nn.Tanh(),
+        )
+        self.rho = nn.Sequential(
+            nn.Linear(hidden + 1, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
             nn.Linear(hidden, 1),
         )
 
-    def forward(self, global_state: torch.Tensor) -> torch.Tensor:
-        return self.net(global_state).squeeze(-1)
+    def forward(self, agent_features: torch.Tensor, log_rms: torch.Tensor) -> torch.Tensor:
+        phi_out = self.phi(agent_features)
+        mean_p = phi_out.mean(dim=-2)
+        max_p = phi_out.max(dim=-2).values
+        pooled = torch.cat([mean_p, max_p, log_rms.unsqueeze(-1)], dim=-1)
+        return self.rho(pooled).squeeze(-1)
 
 
-def global_state_from_obs(obs_list: List[torch.Tensor]) -> torch.Tensor:
-    """Permutation-invariant global state for the centralized critic.
+def build_critic_input(env_agents, v0: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    pos = torch.stack([a.state.pos for a in env_agents], dim=1)
+    rot = torch.stack([a.state.rot for a in env_agents], dim=1)
+    vel = torch.stack([a.state.vel for a in env_agents], dim=1)
 
-    Instead of concatenating agents in a fixed order (which is not permutation-invariant),
-    we build a pooled representation across agents.
+    centroid = pos.mean(dim=1, keepdim=True)
+    centered = pos - centroid
+    rms = centered.pow(2).sum(dim=-1).mean(dim=-1).sqrt().clamp(min=1e-6)
+    pos_norm = centered / rms.unsqueeze(-1).unsqueeze(-1)
 
-    Returns: [B, 2*obs_dim] = concat(mean_pool, max_pool)
-    """
-    x = torch.stack(obs_list, dim=1)  # [B, N, obs_dim]
-    mean_pool = x.mean(dim=1)  # [B, obs_dim]
-    max_pool = x.max(dim=1).values  # [B, obs_dim]
-    return torch.cat([mean_pool, max_pool], dim=-1)
+    cos_th = torch.cos(rot).squeeze(-1)
+    sin_th = torch.sin(rot).squeeze(-1)
+    speed = vel.norm(dim=-1) / max(v0, 1e-8)
+    agent_features = torch.cat(
+        [pos_norm, cos_th.unsqueeze(-1), sin_th.unsqueeze(-1), speed.unsqueeze(-1)],
+        dim=-1,
+    )
+    log_rms = torch.log(rms)
+    return agent_features, log_rms
 
 
 def reset_done_envs(env, obs_list: List[torch.Tensor], dones: torch.Tensor) -> List[torch.Tensor]:
@@ -186,6 +253,7 @@ def compute_gae(
     last_value: torch.Tensor,
     gamma: float,
     lam: float,
+    trunc_values: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     t, b = rewards.shape
     adv = torch.zeros((t, b), device=rewards.device)
@@ -194,7 +262,10 @@ def compute_gae(
     for step in reversed(range(t)):
         nextnonterminal = (~dones[step]).float()
         nextvalues = last_value if step == t - 1 else values[step + 1]
-        delta = rewards[step] + gamma * nextvalues * nextnonterminal - values[step]
+        bootstrap = nextvalues * nextnonterminal
+        if trunc_values is not None:
+            bootstrap = bootstrap + trunc_values[step]
+        delta = rewards[step] + gamma * bootstrap - values[step]
         lastgaelam = delta + gamma * lam * nextnonterminal * lastgaelam
         adv[step] = lastgaelam
 
@@ -203,7 +274,15 @@ def compute_gae(
 
 
 def metric_keys_for_training() -> List[str]:
-    return ["formation_loss", "formation_score", "collision_mean", "action_mean", "sinkhorn_entropy", "speed_mean"]
+    return [
+        "formation_loss",
+        "spacing_loss",
+        "formation_score",
+        "collision_mean",
+        "action_mean",
+        "sinkhorn_entropy",
+        "speed_mean",
+    ]
 
 
 def mean_metrics(infos: List[Dict[str, torch.Tensor]], metric_keys: List[str]) -> Dict[str, float]:
@@ -329,6 +408,11 @@ def main() -> None:
         "formation_sinkhorn_iters": int(args.formation_sinkhorn_iters),
         "formation_eps": float(args.formation_eps),
         "formation_template_seed": int(args.formation_template_seed),
+        "target_spacing_mm": float(args.target_spacing_mm),
+        "spacing_w": float(args.spacing_w),
+        "progress_reward": bool(args.progress_reward),
+        "success_bonus": float(args.success_bonus),
+        "success_threshold": float(args.success_threshold),
         "safe_collision_w": float(args.safe_collision_w),
         "safe_action_w": float(args.safe_action_w),
     }
@@ -349,6 +433,8 @@ def main() -> None:
         scenario_kwargs["normalize_obs"] = bool(args.normalize_obs)
     if args.obs_top_k_neighbors is not None:
         scenario_kwargs["obs_top_k_neighbors"] = int(args.obs_top_k_neighbors)
+    if args.obs_include_goal_rel is not None:
+        scenario_kwargs["obs_include_goal_rel"] = bool(args.obs_include_goal_rel)
 
     # If resuming, infer the expected obs_dim and ask the scenario to pad observations to match.
     # This avoids state_dict load failures when the scenario observation vector has evolved.
@@ -379,31 +465,40 @@ def main() -> None:
         raise RuntimeError(f"env has n_agents={n_agents} but --n-agents={args.n_agents}")
 
     obs_dim = obs_list[0].shape[-1]
-    # Store resolved obs_dim in args for future evaluation / reproducibility.
-    # 保存解析后的 obs_dim，便于评估与复现。（旧 checkpoint 也可从 actor_state 推断。）
     try:
         setattr(args, "obs_dim", int(obs_dim))
-        # Observation schema marker (local, body-frame Top-K neighbors).
-        # 观测结构标记（局部信息 + body frame + Top-K 邻居）。
         setattr(args, "obs_mode", "local_bodyframe_topk_v1")
-        setattr(args, "obs_top_k_neighbors", int(getattr(scenario, "obs_top_k_neighbors", 8)))
+        setattr(args, "obs_top_k_neighbors", int(args.obs_top_k_neighbors) if args.obs_top_k_neighbors is not None else 8)
     except Exception:
         pass
-    global_dim = 2 * obs_dim  # mean+max pooled critic input
     metric_keys = metric_keys_for_training()
 
     actor = Actor(obs_dim=obs_dim, hidden=args.actor_hidden).to(env.device)
-    critic = Critic(global_dim=global_dim, hidden=args.critic_hidden).to(env.device)
+    critic = Critic(per_agent_dim=5, hidden=args.critic_hidden).to(env.device)
     actor_opt = optim.Adam(actor.parameters(), lr=args.lr_actor)
     critic_opt = optim.Adam(critic.parameters(), lr=args.lr_critic)
 
-    # ⭐ AMP: Mixed precision training (1.3-1.8x speedup on GPU)
-    use_amp = (args.device == "cuda" and torch.cuda.is_available())
-    scaler_actor = torch.amp.GradScaler('cuda', enabled=use_amp)
-    scaler_critic = torch.amp.GradScaler('cuda', enabled=use_amp)
+    actor_sched = optim.lr_scheduler.CosineAnnealingLR(
+        actor_opt, T_max=args.total_updates, eta_min=args.lr_actor * args.lr_end_factor,
+    )
+    critic_sched = optim.lr_scheduler.CosineAnnealingLR(
+        critic_opt, T_max=args.total_updates, eta_min=args.lr_critic * args.lr_end_factor,
+    )
+
+    is_cuda = (args.device == "cuda" and torch.cuda.is_available())
+    use_autocast = args.amp and is_cuda
+    use_grad_scaler = args.amp and is_cuda
+    scaler_actor = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
+    scaler_critic = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize TensorBoard writer if enabled
+    writer = None
+    if args.tensorboard:
+        writer = SummaryWriter(log_dir=str(out_dir / "tensorboard"))
+        print(f"TensorBoard logging enabled. Run: tensorboard --logdir={out_dir / 'tensorboard'}")
 
     start_update = 1
     if args.resume:
@@ -416,12 +511,12 @@ def main() -> None:
         critic_opt.load_state_dict(ckpt["critic_opt_state"])
 
         # ⭐ AMP: Restore scaler states if available (best-effort)
-        if use_amp and "scaler_actor_state" in ckpt:
+        if use_grad_scaler and "scaler_actor_state" in ckpt:
             try:
                 scaler_actor.load_state_dict(ckpt["scaler_actor_state"])
             except Exception as e:
                 print(f"WARNING: failed to restore actor scaler state: {e}")
-        if use_amp and "scaler_critic_state" in ckpt:
+        if use_grad_scaler and "scaler_critic_state" in ckpt:
             try:
                 scaler_critic.load_state_dict(ckpt["scaler_critic_state"])
             except Exception as e:
@@ -480,6 +575,9 @@ def main() -> None:
         rew_buf = torch.zeros((T, B), device=env.device)
         done_buf = torch.zeros((T, B), device=env.device, dtype=torch.bool)
         val_buf = torch.zeros((T, B), device=env.device)
+        trunc_val_buf = torch.zeros((T, B), device=env.device)
+        feat_buf = torch.zeros((T, B, n_agents, 5), device=env.device)
+        lrms_buf = torch.zeros((T, B), device=env.device)
 
         # Rolling averages of env-provided diagnostics (Scenario.info()).
         # Keep defaults for missing keys so logging never crashes mid-training.
@@ -489,9 +587,11 @@ def main() -> None:
         rollout_start = time.time()
         for t in range(T):
             # ⭐ AMP: Use autocast for inference (but not for env.step)
-            with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_amp):
-                global_state = global_state_from_obs(obs_list)
-                val_buf[t] = critic(global_state)
+            with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+                feat_t, lrms_t = build_critic_input(env.agents, scenario.v0)
+                feat_buf[t] = feat_t
+                lrms_buf[t] = lrms_t
+                val_buf[t] = critic(feat_t, lrms_t)
 
                 # ⭐ BATCHED ACTOR FORWARD (2-10x speedup!)
                 # Stack all agent observations and forward in one pass instead of N separate calls.
@@ -519,6 +619,11 @@ def main() -> None:
             rew_buf[t] = rews[0]
             done_buf[t] = dones
 
+            if torch.any(dones):
+                with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+                    trunc_feat, trunc_lrms = build_critic_input(env.agents, scenario.v0)
+                    trunc_val_buf[t] = critic(trunc_feat, trunc_lrms) * dones.float()
+
             m = mean_metrics(infos, metric_keys)
             for k in metric_acc.keys():
                 metric_acc[k] += float(m.get(k, 0.0))
@@ -526,9 +631,10 @@ def main() -> None:
 
             obs_list = reset_done_envs(env, obs_list, dones)
 
-        with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_amp):
-            last_value = critic(global_state_from_obs(obs_list))
-            adv, ret = compute_gae(rew_buf, done_buf, val_buf, last_value, args.gamma, args.gae_lambda)
+        with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+            feat_last, lrms_last = build_critic_input(env.agents, scenario.v0)
+            last_value = critic(feat_last, lrms_last)
+            adv, ret = compute_gae(rew_buf, done_buf, val_buf, last_value, args.gamma, args.gae_lambda, trunc_values=trunc_val_buf)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         # Flatten policy batch: (T,B,N)
@@ -538,19 +644,24 @@ def main() -> None:
         adv_flat = adv.unsqueeze(-1).expand(T, B, n_agents).reshape(T * B * n_agents)  # shared-return -> same advantage for all agents
 
         # Flatten value batch: (T,B)
-        # Build permutation-invariant critic inputs from obs_buf by pooling over agents.
-        # obs_buf: [T, B, N, obs_dim]
-        mean_pool = obs_buf.mean(dim=2)  # [T, B, obs_dim]
-        max_pool = obs_buf.max(dim=2).values  # [T, B, obs_dim]
-        global_states = torch.cat([mean_pool, max_pool], dim=-1)  # [T, B, 2*obs_dim]
-        global_flat = global_states.reshape(T * B, global_dim)
+        global_feat_flat = feat_buf.reshape(T * B, n_agents, 5)
+        global_lrms_flat = lrms_buf.reshape(T * B)
         ret_flat = ret.reshape(T * B)
         old_val_flat = val_buf.reshape(T * B)
 
         batch_policy = obs_flat.shape[0]
-        batch_value = global_flat.shape[0]
+        batch_value = global_feat_flat.shape[0]
         mb_policy = min(args.minibatch_size_policy, batch_policy)
         mb_value = min(args.minibatch_size_value, batch_value)
+
+        # Accumulate losses and gradient norms for logging
+        acc_policy_loss = 0.0
+        acc_entropy = 0.0
+        acc_actor_grad_norm = 0.0
+        acc_value_loss = 0.0
+        acc_critic_grad_norm = 0.0
+        n_actor_steps = 0
+        n_critic_steps = 0
 
         for _epoch in range(args.update_epochs):
             ent_coef_now = _ent_coef_at_update(args, update)
@@ -561,7 +672,7 @@ def main() -> None:
                 mb = perm_p[start_i : start_i + mb_policy]
 
                 # ⭐ AMP: Use autocast for forward pass and loss computation
-                with torch.amp.autocast(device_type='cuda', enabled=use_amp):
+                with torch.amp.autocast(device_type='cuda', enabled=use_autocast):
                     logits = actor(obs_flat[mb])
                     dist = torch.distributions.Categorical(logits=logits)
                     new_logp = dist.log_prob(act_flat[mb])
@@ -578,9 +689,16 @@ def main() -> None:
                 # ⭐ AMP: Use scaler for backward pass
                 scaler_actor.scale(actor_loss).backward()
                 scaler_actor.unscale_(actor_opt)
-                nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
+                # Compute gradient norm before clipping
+                actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
                 scaler_actor.step(actor_opt)
                 scaler_actor.update()
+
+                # Accumulate for logging
+                acc_policy_loss += policy_loss.item()
+                acc_entropy += entropy.item()
+                acc_actor_grad_norm += actor_grad_norm.item() if isinstance(actor_grad_norm, torch.Tensor) else float(actor_grad_norm)
+                n_actor_steps += 1
 
             # Critic update
             perm_v = torch.randperm(batch_value, device=env.device)
@@ -588,8 +706,8 @@ def main() -> None:
                 mb = perm_v[start_i : start_i + mb_value]
 
                 # ⭐ AMP: Use autocast for forward pass and loss computation
-                with torch.amp.autocast(device_type='cuda', enabled=use_amp):
-                    values = critic(global_flat[mb])
+                with torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+                    values = critic(global_feat_flat[mb], global_lrms_flat[mb])
 
                     v_old = old_val_flat[mb]
                     v_clipped = v_old + torch.clamp(values - v_old, -args.value_clip, args.value_clip)
@@ -603,9 +721,18 @@ def main() -> None:
                 # ⭐ AMP: Use scaler for backward pass
                 scaler_critic.scale(critic_loss).backward()
                 scaler_critic.unscale_(critic_opt)
-                nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
+                # Compute gradient norm before clipping
+                critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
                 scaler_critic.step(critic_opt)
                 scaler_critic.update()
+
+                # Accumulate for logging
+                acc_value_loss += value_loss.item()
+                acc_critic_grad_norm += critic_grad_norm.item() if isinstance(critic_grad_norm, torch.Tensor) else float(critic_grad_norm)
+                n_critic_steps += 1
+
+        actor_sched.step()
+        critic_sched.step()
 
         if update % args.log_every == 0:
             rollout_time = time.time() - rollout_start
@@ -624,12 +751,50 @@ def main() -> None:
                 + f" act_frac=[STOP {fracs[0]:.2f}, LEFT {fracs[1]:.2f}, RIGHT {fracs[2]:.2f}, STRAIGHT {fracs[3]:.2f}]"
             )
 
+            # TensorBoard logging
+            if writer is not None:
+                # Core RL metrics
+                writer.add_scalar("train/mean_reward", mean_rew, update)
+                writer.add_scalar("train/episode_length", T, update)
+                
+                # Losses
+                if n_actor_steps > 0:
+                    writer.add_scalar("train/policy_loss", acc_policy_loss / n_actor_steps, update)
+                    writer.add_scalar("train/entropy", acc_entropy / n_actor_steps, update)
+                    writer.add_scalar("train/actor_grad_norm", acc_actor_grad_norm / n_actor_steps, update)
+                if n_critic_steps > 0:
+                    writer.add_scalar("train/value_loss", acc_value_loss / n_critic_steps, update)
+                    writer.add_scalar("train/critic_grad_norm", acc_critic_grad_norm / n_critic_steps, update)
+                
+                # Learning rate (from scheduler)
+                writer.add_scalar("train/lr_actor", actor_sched.get_last_lr()[0], update)
+                writer.add_scalar("train/lr_critic", critic_sched.get_last_lr()[0], update)
+                
+                # Entropy coefficient
+                writer.add_scalar("train/ent_coef", _ent_coef_at_update(args, update), update)
+                
+                # Environment metrics
+                for k, v in metric_mean.items():
+                    writer.add_scalar(f"env/{k}", v, update)
+                
+                # Action distribution
+                for i, name in enumerate(["STOP", "LEFT", "RIGHT", "STRAIGHT"]):
+                    writer.add_scalar(f"action_frac/{name}", fracs[i], update)
+                
+                # Training speed
+                writer.add_scalar("train/rollout_time_s", rollout_time, update)
+                writer.add_scalar("train/steps_per_second", T * B / max(rollout_time, 1e-6), update)
+
         if args.save_every > 0 and update % args.save_every == 0:
             payload = _checkpoint_payload(actor, critic, actor_opt, critic_opt, args, update, scaler_actor, scaler_critic)
             save_checkpoint(out_dir / f"ckpt_{update:06d}.pt", payload)
 
     payload = _checkpoint_payload(actor, critic, actor_opt, critic_opt, args, args.total_updates, scaler_actor, scaler_critic)
     save_checkpoint(out_dir / "ckpt_final.pt", payload)
+
+    if writer is not None:
+        writer.close()
+        print(f"TensorBoard logs saved to: {out_dir / 'tensorboard'}")
 
 
 if __name__ == "__main__":

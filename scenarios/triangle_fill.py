@@ -104,8 +104,13 @@ class Scenario(BaseScenario):
 
         # Structure reward settings (used only in formation mode).
         self.formation_w = float(kwargs.pop("formation_w", 1.0))
-        self.formation_sinkhorn_tau = float(kwargs.pop("formation_sinkhorn_tau", 0.1))
-        self.formation_sinkhorn_iters = int(kwargs.pop("formation_sinkhorn_iters", 20))
+        self.target_spacing_mm = float(kwargs.pop("target_spacing_mm", 45.0))
+        self.spacing_w = float(kwargs.pop("spacing_w", 1.0))
+        self.progress_reward = bool(kwargs.pop("progress_reward", True))
+        self.success_bonus = float(kwargs.pop("success_bonus", 0.05))
+        self.success_threshold = float(kwargs.pop("success_threshold", 0.05))
+        self.formation_sinkhorn_tau = float(kwargs.pop("formation_sinkhorn_tau", 0.001))
+        self.formation_sinkhorn_iters = int(kwargs.pop("formation_sinkhorn_iters", 100))
         self.formation_eps = float(kwargs.pop("formation_eps", 1e-8))
         self.formation_template_seed = int(kwargs.pop("formation_template_seed", 0))
         self.safe_collision_w = float(kwargs.pop("safe_collision_w", 0.5))
@@ -135,6 +140,11 @@ class Scenario(BaseScenario):
         # Top-K neighbor observation: how many nearest neighbors to include in observation
         self.obs_top_k_neighbors = int(kwargs.pop("obs_top_k_neighbors", 8))
 
+        # Goal-relative observation: include position/heading relative to formation center
+        self.obs_include_goal_rel = bool(kwargs.pop("obs_include_goal_rel", False))
+        # Formation center (where robots should converge to form triangle)
+        self.formation_center_mm = kwargs.pop("formation_center_mm", (0.0, 0.0))
+
         ScenarioUtils.check_kwargs_consumed(kwargs)
 
         # Convert map boundary size from mm to simulation units.
@@ -147,6 +157,12 @@ class Scenario(BaseScenario):
         self.v0 = self.v0_mm_s * self.mm_to_unit
         # Angular speed (rad/s) is unit-agnostic, so keep as is.
         self.w0 = self.w0_rad_s
+        # Formation center in simulation units
+        self.formation_center = torch.tensor(
+            [self.formation_center_mm[0] * self.mm_to_unit, self.formation_center_mm[1] * self.mm_to_unit],
+            device=device,
+            dtype=torch.float32,
+        )
 
         world = World(
             batch_dim=batch_dim,
@@ -181,10 +197,13 @@ class Scenario(BaseScenario):
             side_length=1.0,
         ).to(device=device, dtype=torch.float32)
         self._formation_template_dist2 = squared_distance_matrix_batched(tmpl.unsqueeze(0))[0]  # [N,N]
+        self.target_spacing = self.target_spacing_mm * self.mm_to_unit
 
         self._rew_per_agent = None
         self._shared_rew = None
         self._info_cache = None
+        self._prev_struct_loss = None
+        self._prev_spacing_loss = None
 
         return world
 
@@ -198,6 +217,8 @@ class Scenario(BaseScenario):
             self._rew_per_agent = None
             self._shared_rew = None
             self._info_cache = None
+            self._prev_struct_loss = None
+            self._prev_spacing_loss = None
             return
 
         # Resolve pile center for this env.
@@ -237,6 +258,10 @@ class Scenario(BaseScenario):
         self._rew_per_agent = None
         self._shared_rew = None
         self._info_cache = None
+        if self._prev_struct_loss is not None:
+            self._prev_struct_loss[env_index] = -1.0
+        if self._prev_spacing_loss is not None:
+            self._prev_spacing_loss[env_index] = -1.0
 
     def _compute_metrics(self):
         pos = torch.stack([a.state.pos for a in self.world.agents], dim=1) # [B,N,2] collect all robots' (x,y)
@@ -259,8 +284,8 @@ class Scenario(BaseScenario):
         speed_mean = vel.norm(dim=-1).mean(dim=-1)  # [B] mean speed across agents
         return pos, collision_pen, action_cost, speed_mean
 
-    def _formation_terms(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return structural loss and Sinkhorn entropy, both shape [B]."""
+    def _formation_terms(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (shape_loss, spacing_loss, sinkhorn_entropy), all [B]."""
         dist2 = squared_distance_matrix_batched(pos)  # [B,N,N]
         cost = row_signature_cost_matrix(dist2, self._formation_template_dist2)  # [B,N,N]
         soft_perm = sinkhorn(
@@ -272,9 +297,18 @@ class Scenario(BaseScenario):
 
         tmpl = self._formation_template_dist2.unsqueeze(0).expand(pos.shape[0], -1, -1)
         dist2_soft = torch.matmul(torch.matmul(soft_perm, tmpl), soft_perm.transpose(1, 2))
-        loss_struct = scale_invariant_distance_loss(dist2, dist2_soft, eps=self.formation_eps)  # [B]
+        shape_loss = scale_invariant_distance_loss(dist2, dist2_soft, eps=self.formation_eps)  # [B]
+
+        dist_mat = dist2.sqrt()
+        inf_diag = torch.full((pos.shape[0], pos.shape[1]), float("inf"), device=pos.device, dtype=dist_mat.dtype)
+        dist_mat = dist_mat + torch.diag_embed(inf_diag)
+        k = min(3, pos.shape[1] - 1)
+        knn = dist_mat.topk(k, dim=-1, largest=False).values
+        mean_3nn = knn.mean(dim=-1).mean(dim=-1)
+        spacing_loss = ((mean_3nn / max(self.target_spacing, 1e-8)) - 1.0).pow(2)
+
         entropy = -(soft_perm * (soft_perm + self.formation_eps).log()).sum(dim=-1).mean(dim=-1)  # [B]
-        return loss_struct, entropy
+        return shape_loss, spacing_loss, entropy
 
     def _build_formation_info(
         self,
@@ -301,19 +335,42 @@ class Scenario(BaseScenario):
         is_first = agent == self.world.agents[0]
         if is_first or (self._rew_per_agent is None and self._shared_rew is None):
             pos, collision_pen, action_cost, speed_mean = self._compute_metrics()
-            formation_loss, sinkhorn_entropy = self._formation_terms(pos)
+            shape_loss, spacing_loss, sinkhorn_entropy = self._formation_terms(pos)
+
+            if self.progress_reward:
+                if self._prev_struct_loss is None:
+                    self._prev_struct_loss = shape_loss.clone()
+                    self._prev_spacing_loss = spacing_loss.clone()
+
+                valid_prev = self._prev_struct_loss >= 0.0
+                shape_progress = torch.where(
+                    valid_prev, self._prev_struct_loss - shape_loss, torch.zeros_like(shape_loss)
+                )
+                spacing_progress = torch.where(
+                    valid_prev, self._prev_spacing_loss - spacing_loss, torch.zeros_like(spacing_loss)
+                )
+                self._prev_struct_loss = shape_loss.clone()
+                self._prev_spacing_loss = spacing_loss.clone()
+                formation_reward = self.formation_w * shape_progress + self.spacing_w * spacing_progress
+            else:
+                formation_reward = -self.formation_w * shape_loss - self.spacing_w * spacing_loss
+
+            success_mask = (shape_loss < self.success_threshold).float()
+            formation_reward = formation_reward + self.success_bonus * success_mask
+
             per_agent = (
-                -self.formation_w * formation_loss.unsqueeze(-1)
+                formation_reward.unsqueeze(-1)
                 - self.safe_collision_w * collision_pen
                 - self.safe_action_w * action_cost
             )
             self._info_cache = self._build_formation_info(
-                formation_loss=formation_loss,
+                formation_loss=shape_loss,
                 collision_pen=collision_pen,
                 action_cost=action_cost,
                 speed_mean=speed_mean,
                 sinkhorn_entropy=sinkhorn_entropy,
             )
+            self._info_cache["spacing_loss"] = spacing_loss
 
             if self.share_reward:
                 self._shared_rew = per_agent.mean(dim=-1)  # [B]
@@ -391,8 +448,7 @@ class Scenario(BaseScenario):
         dy_body = -sin_theta * dx_world + cos_theta * dy_world  # [B, N, actual_k]
         topk_rel_pos_body = torch.stack([dx_body, dy_body], dim=-1)  # [B, N, actual_k, 2]
 
-        # ⭐ CRITICAL FIX: Replace invalid distances with comm_r (so they normalize to 1.0, not 1e10!).
-        topk_dists = torch.where(topk_valid > 0.5, topk_dists, torch.full_like(topk_dists, self.comm_r))
+        topk_dists = torch.where(topk_valid > 0.5, topk_dists, torch.zeros_like(topk_dists))
         # Also zero out relative position for invalid slots.
         topk_rel_pos_body = topk_rel_pos_body * topk_valid.unsqueeze(-1)
 
@@ -411,7 +467,6 @@ class Scenario(BaseScenario):
                 device=pos.device,
                 dtype=topk_features.dtype
             )
-            padding[:, :, :, 2] = self.comm_r
             self._top_k_neighbors = torch.cat([topk_features, padding], dim=2)  # [B, N, K, 4]
         else:
             self._top_k_neighbors = topk_features  # [B, N, K, 4]
@@ -492,6 +547,39 @@ class Scenario(BaseScenario):
             top_k_neighbors_flat_n,     # [K*4] Top-K邻居信息（展平，body frame）
         ], dim=-1)  # Total dim / 总维度：3 + K*4
 
+        # 6. Optional: include goal-relative observation (position relative to formation center)
+        if self.obs_include_goal_rel:
+            # Position relative to formation center (world frame)
+            pos_world = agent.state.pos  # [B, 2]
+            goal_rel_world = pos_world - self.formation_center.unsqueeze(0)  # [B, 2]
+            
+            # Convert to body frame
+            rot = agent.state.rot  # [B, 1]
+            cos_theta = torch.cos(rot).squeeze(-1)  # [B]
+            sin_theta = torch.sin(rot).squeeze(-1)  # [B]
+            goal_rel_x_body = cos_theta * goal_rel_world[:, 0] + sin_theta * goal_rel_world[:, 1]
+            goal_rel_y_body = -sin_theta * goal_rel_world[:, 0] + cos_theta * goal_rel_world[:, 1]
+            goal_rel_body = torch.stack([goal_rel_x_body, goal_rel_y_body], dim=-1)  # [B, 2]
+            
+            # Distance and angle to center
+            goal_dist = goal_rel_world.norm(dim=-1, keepdim=True)  # [B, 1]
+            goal_angle = torch.atan2(goal_rel_world[:, 1], goal_rel_world[:, 0]).unsqueeze(-1)  # [B, 1]
+            heading_error = goal_angle - rot  # [B, 1] angle to center relative to agent heading
+            heading_error = torch.atan2(torch.sin(heading_error), torch.cos(heading_error))  # normalize to [-pi, pi]
+            
+            # Normalize goal-relative features
+            if self.normalize_obs:
+                goal_rel_body_n = goal_rel_body / max(self.world_semidim, 1e-8)
+                goal_dist_n = goal_dist / max(self.world_semidim, 1e-8)
+                heading_error_n = heading_error / math.pi  # normalize to [-1, 1]
+            else:
+                goal_rel_body_n = goal_rel_body
+                goal_dist_n = goal_dist
+                heading_error_n = heading_error
+            
+            goal_features = torch.cat([goal_rel_body_n, goal_dist_n, heading_error_n], dim=-1)  # [B, 4]
+            obs = torch.cat([obs, goal_features], dim=-1)  # [B, 3+K*4 + 4]
+
         # 5. Optional checkpoint compatibility: fit observation dim to obs_pad_to_dim.
         if self.obs_pad_to_dim is not None:
             if obs.shape[-1] < self.obs_pad_to_dim:
@@ -509,7 +597,7 @@ class Scenario(BaseScenario):
     def info(self, agent: Agent):
         if self._info_cache is None:
             pos, collision_pen, action_cost, speed_mean = self._compute_metrics()
-            formation_loss, sinkhorn_entropy = self._formation_terms(pos)
+            formation_loss, spacing_loss, sinkhorn_entropy = self._formation_terms(pos)
             self._info_cache = self._build_formation_info(
                 formation_loss=formation_loss,
                 collision_pen=collision_pen,
@@ -517,6 +605,7 @@ class Scenario(BaseScenario):
                 speed_mean=speed_mean,
                 sinkhorn_entropy=sinkhorn_entropy,
             )
+            self._info_cache["spacing_loss"] = spacing_loss
         return self._info_cache
 
     def done(self):

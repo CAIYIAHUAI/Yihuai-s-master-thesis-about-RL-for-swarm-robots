@@ -1,0 +1,29 @@
+[project]
+name = "yihuai-master-thesis"
+version = "0.1.0"
+description = "MAPPO training for VMAS triangle-fill (Kilobot-like swarm formation control)"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "torch>=2.10.0",
+    "vmas>=1.5.2",
+    "pyyaml>=6.0",
+    "tensorboard>=2.20.0",
+    "imageio>=2.37.0",
+    "imageio-ffmpeg>=0.6.0",
+    "matplotlib>=3.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-cov>=7.0",
+]
+
+[tool.uv]
+index = [
+    { name = "pytorch-cu128", url = "https://download.pytorch.org/whl/cu128", explicit = true },
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

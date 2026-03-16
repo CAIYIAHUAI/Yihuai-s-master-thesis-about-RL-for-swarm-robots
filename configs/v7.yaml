@@ -1,0 +1,49 @@
+# Triangle Fill v7 - Stage A (shape-first)
+device: cuda
+num-envs: 128
+n-agents: 30
+max-episode-steps: 1000
+
+rollout-steps: 512
+total-updates: 2000
+
+actor-hidden: 256
+critic-hidden: 512
+
+lr-actor: 3e-4
+lr-critic: 3e-4
+lr-end-factor: 0.1
+gamma: 0.99
+gae-lambda: 0.95
+clip-coef: 0.2
+update-epochs: 4
+minibatch-size-policy: 2048
+minibatch-size-value: 2048
+value-clip: 0.2
+max-grad-norm: 0.5
+
+# Lower exploration vs v6
+ent-coef: 0.02
+ent-coef-end: 0.002
+ent-decay-updates: 1500
+
+# Reward: stronger signal first
+formation-w: 5.0
+spacing-w: 1.0
+target-spacing-mm: 45.0
+progress-reward: false
+success-bonus: 0.0
+success-threshold: 0.05
+safe-collision-w: 0.5
+safe-action-w: 0.0
+
+formation-sinkhorn-tau: 0.001
+formation-sinkhorn-iters: 100
+
+amp: false
+seed: 43
+
+log-every: 10
+save-every: 100
+tensorboard: true
+out-dir: runs/triangle_fill_v7_stageA

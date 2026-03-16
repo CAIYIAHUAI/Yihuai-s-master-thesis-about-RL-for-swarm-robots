@@ -1,2 +1,2 @@
-from .triangle_fill import Scenario, TriangleSpec
+from .triangle_fill import Scenario
 

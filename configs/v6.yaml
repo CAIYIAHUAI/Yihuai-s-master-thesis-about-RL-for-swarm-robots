@@ -1,0 +1,68 @@
+# ============================================================================
+# Triangle Fill v6 Training Config
+# ============================================================================
+# Key changes from v5:
+#   - tau: 0.1 -> 0.001 (fix Sinkhorn matching)
+#   - New DeepSets CTDE Critic (replaces old pooled-obs critic)
+#   - Progress-based reward (delta loss, not absolute loss)
+#   - Spacing loss (3-NN relative to target)
+#   - Hex-lattice template (replaces Halton)
+# ============================================================================
+
+# --- Core ---
+device: cuda
+num-envs: 512
+n-agents: 30
+max-episode-steps: 1000
+
+# --- Training length ---
+rollout-steps: 512
+total-updates: 8000
+
+# --- Model ---
+actor-hidden: 256
+critic-hidden: 512
+
+# --- PPO ---
+lr-actor: 3e-4
+lr-critic: 3e-4
+lr-end-factor: 0.1
+gamma: 0.99
+gae-lambda: 0.95
+clip-coef: 0.2
+update-epochs: 4
+minibatch-size-policy: 2048
+minibatch-size-value: 2048
+value-clip: 0.2
+max-grad-norm: 0.5
+
+# --- Entropy (exploration → exploitation) ---
+ent-coef: 0.05
+ent-coef-end: 0.005
+ent-decay-updates: 6000
+
+# --- Reward ---
+formation-w: 5.0           # Amplify progress signal (delta ~ 0.01 per step)
+spacing-w: 2.0             # Scale convergence to physical target
+target-spacing-mm: 45.0    # ~2.7 robot diameters
+progress-reward: true      # Use delta-loss, not absolute loss
+success-bonus: 0.05        # Small per-step settle bonus
+success-threshold: 0.05    # formation_loss threshold for bonus
+safe-collision-w: 0.5      # Collision penalty
+safe-action-w: 0.0         # No action penalty (let agents explore freely)
+
+# --- Sinkhorn (tau=0.001 fixes the matching bug) ---
+formation-sinkhorn-tau: 0.001
+formation-sinkhorn-iters: 100
+
+# --- Stability ---
+amp: false                 # fp32 for stable PPO gradients
+
+# --- Reproducibility ---
+seed: 42
+
+# --- Logging ---
+log-every: 10
+save-every: 200
+tensorboard: true
+out-dir: runs/triangle_fill_v6

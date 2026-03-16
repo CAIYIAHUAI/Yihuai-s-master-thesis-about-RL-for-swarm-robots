@@ -3,9 +3,12 @@ from __future__ import annotations
 import torch
 
 
-def row_signature_cost_matrix(dist_a: torch.Tensor, dist_b: torch.Tensor) -> torch.Tensor:
+def row_signature_cost_matrix(dist_a: torch.Tensor, dist_b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
-    Build pairwise row-signature cost matrix.
+    Build pairwise row-signature cost matrix (scale-invariant).
+
+    Each row's sorted distance signature is normalized by its mean so that
+    the comparison depends only on relative distance profiles, not absolute scale.
 
     dist_a: [B, N, N]
     dist_b: [N, N]
@@ -20,6 +23,9 @@ def row_signature_cost_matrix(dist_a: torch.Tensor, dist_b: torch.Tensor) -> tor
     dist_b_batch = dist_b.unsqueeze(0).expand(bsz, -1, -1)
     b_masked = dist_b_batch.masked_fill(diag_mask, float("inf"))
     b_sig = torch.sort(b_masked, dim=-1).values[:, :, : n - 1]  # [B,N,N-1]
+
+    a_sig = a_sig / (a_sig.mean(dim=-1, keepdim=True) + eps)
+    b_sig = b_sig / (b_sig.mean(dim=-1, keepdim=True) + eps)
 
     diff = a_sig.unsqueeze(2) - b_sig.unsqueeze(1)  # [B,N,N,N-1]
     return (diff * diff).mean(dim=-1)  # [B,N,N]
