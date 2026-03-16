@@ -28,6 +28,9 @@ runs/
 .DS_Store
 Thumbs.db
 
+# User-local uv config (e.g. mirror overrides)
+uv.toml
+
 # Misc
 *.log
 .tmp/

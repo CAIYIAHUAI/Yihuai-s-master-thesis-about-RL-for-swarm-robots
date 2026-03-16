@@ -59,6 +59,24 @@ uv run python render_video.py --checkpoint runs/<run_name>/ckpt_final.pt
 uv run pytest tests/
 ```
 
+## China Mainland / 国内用户加速
+
+默认源在国外，下载 PyTorch (~900MB) 可能很慢。在项目根目录创建 `uv.toml` 即可使用清华镜像：
+
+```toml
+# uv.toml — 国内镜像加速（不要提交到 git）
+default-index = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+[[index]]
+name = "pytorch-cu128"
+url = "https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/cu128"
+explicit = true
+```
+
+然后正常运行 `uv sync` 即可。镜像与官方源内容完全一致，`uv.lock` 保证版本和 hash 精确匹配。
+
+> 此文件已被 `.gitignore` 忽略，不会影响其他用户。
+
 ## CPU-only
 
 If you don't have a GPU, change `device: cpu` in the config YAML, or pass `--device cpu`. Note: training will be significantly slower.
