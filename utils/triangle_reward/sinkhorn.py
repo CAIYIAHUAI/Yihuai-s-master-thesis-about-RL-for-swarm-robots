@@ -39,12 +39,52 @@ def sinkhorn(cost: torch.Tensor, tau: float = 0.1, iters: int = 20, eps: float =
     returns: [B, N, N]
     """
     temperature = max(float(tau), float(eps))
-    logits = -cost / temperature
-    logits = logits - logits.amax(dim=(-2, -1), keepdim=True)
-    prob = torch.exp(logits)
+    log_prob = -cost / temperature
+    log_prob = log_prob - log_prob.amax(dim=(-2, -1), keepdim=True)
 
     for _ in range(int(iters)):
-        prob = prob / (prob.sum(dim=-1, keepdim=True) + eps)
-        prob = prob / (prob.sum(dim=-2, keepdim=True) + eps)
+        log_prob = log_prob - torch.logsumexp(log_prob, dim=-1, keepdim=True)
+        log_prob = log_prob - torch.logsumexp(log_prob, dim=-2, keepdim=True)
 
-    return prob
+    return torch.exp(log_prob)
+
+
+def formation_soft_permutation(
+    dist2: torch.Tensor,
+    template_dist2: torch.Tensor,
+    tau: float = 0.1,
+    iters: int = 20,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    cost = row_signature_cost_matrix(dist2, template_dist2, eps=eps)
+    return sinkhorn(cost, tau=tau, iters=iters, eps=eps)
+
+
+def make_formation_soft_permutation_fn(
+    tau: float,
+    iters: int,
+    eps: float,
+    compile_enabled: bool = False,
+):
+    def soft_perm_fn(dist2: torch.Tensor, template_dist2: torch.Tensor) -> torch.Tensor:
+        return formation_soft_permutation(
+            dist2,
+            template_dist2,
+            tau=tau,
+            iters=iters,
+            eps=eps,
+        )
+
+    if not compile_enabled:
+        return soft_perm_fn
+
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        print("WARNING: torch.compile() is unavailable; leaving formation matching uncompiled.")
+        return soft_perm_fn
+
+    try:
+        return compile_fn(soft_perm_fn)
+    except Exception as e:
+        print(f"WARNING: failed to compile formation matching; continuing without compile. Reason: {e}")
+        return soft_perm_fn

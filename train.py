@@ -88,6 +88,18 @@ def parse_args() -> argparse.Namespace:
         help="Enable mixed-precision (AMP). Off by default — PPO actor gradients are sensitive to fp16.",
     )
     p.add_argument(
+        "--amp-dtype",
+        default="bf16",
+        choices=["fp16", "bf16"],
+        help="Autocast dtype to use when AMP is enabled. bf16 is usually safer for PPO on Ada GPUs.",
+    )
+    p.add_argument(
+        "--torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compile actor and critic with torch.compile() for lower kernel-launch overhead.",
+    )
+    p.add_argument(
         "--lr-end-factor",
         type=float,
         default=0.1,
@@ -97,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     # Task config
     p.add_argument("--formation-w", type=float, default=1.0)
     p.add_argument("--formation-sinkhorn-tau", type=float, default=0.001)
-    p.add_argument("--formation-sinkhorn-iters", type=int, default=100)
+    p.add_argument("--formation-sinkhorn-iters", type=int, default=30)
     p.add_argument("--formation-eps", type=float, default=1e-8)
     p.add_argument("--formation-template-seed", type=int, default=0)
     p.add_argument("--target-spacing-mm", type=float, default=45.0, help="Target nearest-neighbor distance in mm.")
@@ -291,16 +303,37 @@ def metric_keys_for_training() -> List[str]:
     ]
 
 
-def mean_metrics(infos: List[Dict[str, torch.Tensor]], metric_keys: List[str]) -> Dict[str, float]:
+def accumulate_metrics(
+    metric_acc: Dict[str, torch.Tensor],
+    infos: List[Dict[str, torch.Tensor]],
+    metric_keys: List[str],
+) -> None:
     if not infos:
-        return {}
+        return
     info0 = infos[0]
-    out = {}
     for k in metric_keys:
         v = info0.get(k, None)
         if isinstance(v, torch.Tensor) and v.numel() > 0:
-            out[k] = v.float().mean().item()
-    return out
+            metric_acc[k] += v.float().mean().detach()
+
+
+def finalize_metric_means(metric_acc: Dict[str, torch.Tensor], metric_steps: int) -> Dict[str, float]:
+    denom = max(metric_steps, 1)
+    return {k: (v / denom).item() for k, v in metric_acc.items()}
+
+
+def maybe_compile_module(module: nn.Module, enabled: bool, name: str) -> nn.Module:
+    if not enabled:
+        return module
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        print(f"WARNING: torch.compile() is unavailable; leaving {name} uncompiled.")
+        return module
+    try:
+        return compile_fn(module)
+    except Exception as e:
+        print(f"WARNING: failed to compile {name}; continuing without compile. Reason: {e}")
+        return module
 
 
 def _checkpoint_payload(
@@ -422,6 +455,7 @@ def main() -> None:
         "success_threshold": float(args.success_threshold),
         "safe_collision_w": float(args.safe_collision_w),
         "safe_action_w": float(args.safe_action_w),
+        "torch_compile": bool(args.torch_compile),
     }
     if (args.pile_center_y_mm_min is None) ^ (args.pile_center_y_mm_max is None):
         raise ValueError("--pile-center-y-mm-min and --pile-center-y-mm-max must be set together")
@@ -480,10 +514,10 @@ def main() -> None:
         pass
     metric_keys = metric_keys_for_training()
 
-    actor = Actor(obs_dim=obs_dim, hidden=args.actor_hidden).to(env.device)
-    critic = Critic(per_agent_dim=5, hidden=args.critic_hidden).to(env.device)
-    actor_opt = optim.Adam(actor.parameters(), lr=args.lr_actor)
-    critic_opt = optim.Adam(critic.parameters(), lr=args.lr_critic)
+    actor_model = Actor(obs_dim=obs_dim, hidden=args.actor_hidden).to(env.device)
+    critic_model = Critic(per_agent_dim=5, hidden=args.critic_hidden).to(env.device)
+    actor_opt = optim.Adam(actor_model.parameters(), lr=args.lr_actor)
+    critic_opt = optim.Adam(critic_model.parameters(), lr=args.lr_critic)
 
     actor_sched = optim.lr_scheduler.CosineAnnealingLR(
         actor_opt, T_max=args.total_updates, eta_min=args.lr_actor * args.lr_end_factor,
@@ -493,8 +527,9 @@ def main() -> None:
     )
 
     is_cuda = (args.device == "cuda" and torch.cuda.is_available())
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     use_autocast = args.amp and is_cuda
-    use_grad_scaler = args.amp and is_cuda
+    use_grad_scaler = use_autocast and amp_dtype == torch.float16
     scaler_actor = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
     scaler_critic = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
 
@@ -512,8 +547,8 @@ def main() -> None:
         ckpt_path = Path(args.resume)
         ckpt = load_checkpoint(ckpt_path, device=env.device)
 
-        actor.load_state_dict(ckpt["actor_state"])
-        critic.load_state_dict(ckpt["critic_state"])
+        actor_model.load_state_dict(ckpt["actor_state"])
+        critic_model.load_state_dict(ckpt["critic_state"])
         actor_opt.load_state_dict(ckpt["actor_opt_state"])
         critic_opt.load_state_dict(ckpt["critic_opt_state"])
 
@@ -574,27 +609,29 @@ def main() -> None:
 
     T = args.rollout_steps
     B = env.batch_dim
+    actor = maybe_compile_module(actor_model, bool(args.torch_compile), "actor")
+    critic = maybe_compile_module(critic_model, bool(args.torch_compile), "critic")
+
+    obs_buf = torch.empty((T, B, n_agents, obs_dim), device=env.device)
+    act_buf = torch.empty((T, B, n_agents), device=env.device, dtype=torch.long)
+    logp_buf = torch.empty((T, B, n_agents), device=env.device)
+    rew_buf = torch.empty((T, B, n_agents), device=env.device)
+    done_buf = torch.empty((T, B), device=env.device, dtype=torch.bool)
+    val_buf = torch.empty((T, B), device=env.device)
+    trunc_val_buf = torch.empty((T, B), device=env.device)
+    feat_buf = torch.empty((T, B, n_agents, 5), device=env.device)
+    lrms_buf = torch.empty((T, B), device=env.device)
 
     for update in range(start_update, args.total_updates + 1):
-        obs_buf = torch.zeros((T, B, n_agents, obs_dim), device=env.device)
-        act_buf = torch.zeros((T, B, n_agents), device=env.device, dtype=torch.long)
-        logp_buf = torch.zeros((T, B, n_agents), device=env.device)
-        rew_buf = torch.zeros((T, B, n_agents), device=env.device)
-        done_buf = torch.zeros((T, B), device=env.device, dtype=torch.bool)
-        val_buf = torch.zeros((T, B), device=env.device)
-        trunc_val_buf = torch.zeros((T, B), device=env.device)
-        feat_buf = torch.zeros((T, B, n_agents, 5), device=env.device)
-        lrms_buf = torch.zeros((T, B), device=env.device)
-
         # Rolling averages of env-provided diagnostics (Scenario.info()).
         # Keep defaults for missing keys so logging never crashes mid-training.
-        metric_acc = {k: 0.0 for k in metric_keys}
+        metric_acc = {k: torch.zeros((), device=env.device) for k in metric_keys}
         metric_steps = 0
 
         rollout_start = time.time()
         for t in range(T):
             # ⭐ AMP: Use autocast for inference (but not for env.step)
-            with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+            with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
                 feat_t, lrms_t = build_critic_input(env.agents, scenario.v0)
                 feat_buf[t] = feat_t
                 lrms_buf[t] = lrms_t
@@ -625,20 +662,22 @@ def main() -> None:
             obs_list, rews, dones, infos = env.step(actions_for_env)
             rew_buf[t] = torch.stack(rews, dim=1)
             done_buf[t] = dones
+            trunc_val_buf[t].zero_()
 
             if torch.any(dones):
-                with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+                with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
                     trunc_feat, trunc_lrms = build_critic_input(env.agents, scenario.v0)
                     trunc_val_buf[t] = critic(trunc_feat, trunc_lrms) * dones.float()
 
-            m = mean_metrics(infos, metric_keys)
-            for k in metric_acc.keys():
-                metric_acc[k] += float(m.get(k, 0.0))
+            accumulate_metrics(metric_acc, infos, metric_keys)
             metric_steps += 1
 
             obs_list = reset_done_envs(env, obs_list, dones)
 
-        with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+        rollout_time = time.time() - rollout_start
+        update_start = time.time()
+
+        with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
             feat_last, lrms_last = build_critic_input(env.agents, scenario.v0)
             last_value = critic(feat_last, lrms_last)
             val_buf_n = val_buf.unsqueeze(-1).expand(T, B, n_agents)
@@ -675,11 +714,11 @@ def main() -> None:
         mb_value = min(args.minibatch_size_value, batch_value)
 
         # Accumulate losses and gradient norms for logging
-        acc_policy_loss = 0.0
-        acc_entropy = 0.0
-        acc_actor_grad_norm = 0.0
-        acc_value_loss = 0.0
-        acc_critic_grad_norm = 0.0
+        acc_policy_loss = torch.zeros((), device=env.device)
+        acc_entropy = torch.zeros((), device=env.device)
+        acc_actor_grad_norm = torch.zeros((), device=env.device)
+        acc_value_loss = torch.zeros((), device=env.device)
+        acc_critic_grad_norm = torch.zeros((), device=env.device)
         n_actor_steps = 0
         n_critic_steps = 0
 
@@ -692,7 +731,7 @@ def main() -> None:
                 mb = perm_p[start_i : start_i + mb_policy]
 
                 # ⭐ AMP: Use autocast for forward pass and loss computation
-                with torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+                with torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
                     logits = actor(obs_flat[mb])
                     dist = torch.distributions.Categorical(logits=logits)
                     new_logp = dist.log_prob(act_flat[mb])
@@ -710,14 +749,18 @@ def main() -> None:
                 scaler_actor.scale(actor_loss).backward()
                 scaler_actor.unscale_(actor_opt)
                 # Compute gradient norm before clipping
-                actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
+                actor_grad_norm = nn.utils.clip_grad_norm_(actor_model.parameters(), args.max_grad_norm)
                 scaler_actor.step(actor_opt)
                 scaler_actor.update()
 
                 # Accumulate for logging
-                acc_policy_loss += policy_loss.item()
-                acc_entropy += entropy.item()
-                acc_actor_grad_norm += actor_grad_norm.item() if isinstance(actor_grad_norm, torch.Tensor) else float(actor_grad_norm)
+                acc_policy_loss += policy_loss.detach()
+                acc_entropy += entropy.detach()
+                acc_actor_grad_norm += (
+                    actor_grad_norm.detach()
+                    if isinstance(actor_grad_norm, torch.Tensor)
+                    else torch.tensor(actor_grad_norm, device=env.device)
+                )
                 n_actor_steps += 1
 
             # Critic update
@@ -726,7 +769,7 @@ def main() -> None:
                 mb = perm_v[start_i : start_i + mb_value]
 
                 # ⭐ AMP: Use autocast for forward pass and loss computation
-                with torch.amp.autocast(device_type='cuda', enabled=use_autocast):
+                with torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
                     values = critic(global_feat_flat[mb], global_lrms_flat[mb])
 
                     v_old = old_val_flat[mb]
@@ -742,22 +785,27 @@ def main() -> None:
                 scaler_critic.scale(critic_loss).backward()
                 scaler_critic.unscale_(critic_opt)
                 # Compute gradient norm before clipping
-                critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
+                critic_grad_norm = nn.utils.clip_grad_norm_(critic_model.parameters(), args.max_grad_norm)
                 scaler_critic.step(critic_opt)
                 scaler_critic.update()
 
                 # Accumulate for logging
-                acc_value_loss += value_loss.item()
-                acc_critic_grad_norm += critic_grad_norm.item() if isinstance(critic_grad_norm, torch.Tensor) else float(critic_grad_norm)
+                acc_value_loss += value_loss.detach()
+                acc_critic_grad_norm += (
+                    critic_grad_norm.detach()
+                    if isinstance(critic_grad_norm, torch.Tensor)
+                    else torch.tensor(critic_grad_norm, device=env.device)
+                )
                 n_critic_steps += 1
 
         actor_sched.step()
         critic_sched.step()
+        update_time = time.time() - update_start
 
         if update % args.log_every == 0:
-            rollout_time = time.time() - rollout_start
             mean_rew = rew_buf.mean().item()
-            metric_mean = {k: (v / max(metric_steps, 1)) for k, v in metric_acc.items()}
+            metric_mean = finalize_metric_means(metric_acc, metric_steps)
+            total_time = rollout_time + update_time
 
             # Action histogram across the whole rollout (diagnostic for "all STOP" or other degenerate policies).
             # act_buf: [T,B,N] with discrete ids {0,1,2,3}.
@@ -765,7 +813,7 @@ def main() -> None:
             counts = torch.bincount(act_flat_all, minlength=4).float()
             fracs = (counts / counts.sum().clamp_min(1.0)).tolist()
             print(
-                f"update={update:5d} mean_rew={mean_rew:+.4f} rollout_s={rollout_time:.2f} "
+                f"update={update:5d} mean_rew={mean_rew:+.4f} rollout_s={rollout_time:.2f} update_s={update_time:.2f} "
                 + " ".join([f"{k}={metric_mean.get(k, 0.0):.3f}" for k in metric_keys])
                 + f" ent_coef={_ent_coef_at_update(args, update):.4f}"
                 + f" act_frac=[STOP {fracs[0]:.2f}, LEFT {fracs[1]:.2f}, RIGHT {fracs[2]:.2f}, STRAIGHT {fracs[3]:.2f}]"
@@ -779,12 +827,12 @@ def main() -> None:
                 
                 # Losses
                 if n_actor_steps > 0:
-                    writer.add_scalar("train/policy_loss", acc_policy_loss / n_actor_steps, update)
-                    writer.add_scalar("train/entropy", acc_entropy / n_actor_steps, update)
-                    writer.add_scalar("train/actor_grad_norm", acc_actor_grad_norm / n_actor_steps, update)
+                    writer.add_scalar("train/policy_loss", (acc_policy_loss / n_actor_steps).item(), update)
+                    writer.add_scalar("train/entropy", (acc_entropy / n_actor_steps).item(), update)
+                    writer.add_scalar("train/actor_grad_norm", (acc_actor_grad_norm / n_actor_steps).item(), update)
                 if n_critic_steps > 0:
-                    writer.add_scalar("train/value_loss", acc_value_loss / n_critic_steps, update)
-                    writer.add_scalar("train/critic_grad_norm", acc_critic_grad_norm / n_critic_steps, update)
+                    writer.add_scalar("train/value_loss", (acc_value_loss / n_critic_steps).item(), update)
+                    writer.add_scalar("train/critic_grad_norm", (acc_critic_grad_norm / n_critic_steps).item(), update)
                 
                 # Learning rate (from scheduler)
                 writer.add_scalar("train/lr_actor", actor_sched.get_last_lr()[0], update)
@@ -803,13 +851,15 @@ def main() -> None:
                 
                 # Training speed
                 writer.add_scalar("train/rollout_time_s", rollout_time, update)
-                writer.add_scalar("train/steps_per_second", T * B / max(rollout_time, 1e-6), update)
+                writer.add_scalar("train/update_time_s", update_time, update)
+                writer.add_scalar("train/steps_per_second", T * B / max(total_time, 1e-6), update)
+                writer.add_scalar("train/env_steps_per_second", T * B / max(rollout_time, 1e-6), update)
 
         if args.save_every > 0 and update % args.save_every == 0:
-            payload = _checkpoint_payload(actor, critic, actor_opt, critic_opt, args, update, scaler_actor, scaler_critic)
+            payload = _checkpoint_payload(actor_model, critic_model, actor_opt, critic_opt, args, update, scaler_actor, scaler_critic)
             save_checkpoint(out_dir / f"ckpt_{update:06d}.pt", payload)
 
-    payload = _checkpoint_payload(actor, critic, actor_opt, critic_opt, args, args.total_updates, scaler_actor, scaler_critic)
+    payload = _checkpoint_payload(actor_model, critic_model, actor_opt, critic_opt, args, args.total_updates, scaler_actor, scaler_critic)
     save_checkpoint(out_dir / "ckpt_final.pt", payload)
 
     if writer is not None:

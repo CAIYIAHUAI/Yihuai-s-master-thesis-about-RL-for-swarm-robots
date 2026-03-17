@@ -8,9 +8,8 @@ from vmas.simulator.scenario import BaseScenario
 from vmas.simulator.utils import Color, ScenarioUtils
 from utils.triangle_reward import (
     build_triangle_template,
-    row_signature_cost_matrix,
+    make_formation_soft_permutation_fn,
     scale_invariant_distance_loss,
-    sinkhorn,
     squared_distance_matrix_batched,
 )
 
@@ -86,6 +85,7 @@ class Kilobot4ActionDynamics(Dynamics):
 
 class Scenario(BaseScenario):
     def make_world(self, batch_dim:int, device:torch.device, **kwargs) -> World:
+        device_type = device.type if isinstance(device, torch.device) else str(device).split(":", 1)[0]
         self.n_agents = int(kwargs.pop("n_agents", 30))
         self.share_reward = bool(kwargs.pop("share_reward", True)) # I dont want agents to be selfish
 
@@ -110,11 +110,12 @@ class Scenario(BaseScenario):
         self.success_bonus = float(kwargs.pop("success_bonus", 0.05))
         self.success_threshold = float(kwargs.pop("success_threshold", 0.05))
         self.formation_sinkhorn_tau = float(kwargs.pop("formation_sinkhorn_tau", 0.001))
-        self.formation_sinkhorn_iters = int(kwargs.pop("formation_sinkhorn_iters", 100))
+        self.formation_sinkhorn_iters = int(kwargs.pop("formation_sinkhorn_iters", 30))
         self.formation_eps = float(kwargs.pop("formation_eps", 1e-8))
         self.formation_template_seed = int(kwargs.pop("formation_template_seed", 0))
         self.safe_collision_w = float(kwargs.pop("safe_collision_w", 0.5))
         self.safe_action_w = float(kwargs.pop("safe_action_w", 0.02))
+        self.torch_compile = bool(kwargs.pop("torch_compile", False))
 
         # Spawn (pile) config for formation training.
         # We keep the default spawn below origin to avoid immediate dense collisions.
@@ -197,6 +198,12 @@ class Scenario(BaseScenario):
             side_length=1.0,
         ).to(device=device, dtype=torch.float32)
         self._formation_template_dist2 = squared_distance_matrix_batched(tmpl.unsqueeze(0))[0]  # [N,N]
+        self._formation_soft_perm = make_formation_soft_permutation_fn(
+            tau=self.formation_sinkhorn_tau,
+            iters=self.formation_sinkhorn_iters,
+            eps=self.formation_eps,
+            compile_enabled=self.torch_compile and device_type == "cuda",
+        )
         self.target_spacing = self.target_spacing_mm * self.mm_to_unit
 
         self._rew_per_agent = None
@@ -289,13 +296,7 @@ class Scenario(BaseScenario):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return global logging terms plus per-agent formation terms."""
         dist2 = squared_distance_matrix_batched(pos)  # [B,N,N]
-        cost = row_signature_cost_matrix(dist2, self._formation_template_dist2)  # [B,N,N]
-        soft_perm = sinkhorn(
-            cost,
-            tau=self.formation_sinkhorn_tau,
-            iters=self.formation_sinkhorn_iters,
-            eps=self.formation_eps,
-        )
+        soft_perm = self._formation_soft_perm(dist2, self._formation_template_dist2)
 
         tmpl = self._formation_template_dist2.unsqueeze(0).expand(pos.shape[0], -1, -1)
         dist2_soft = torch.matmul(torch.matmul(soft_perm, tmpl), soft_perm.transpose(1, 2))

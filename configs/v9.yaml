@@ -1,5 +1,9 @@
-# Triangle Fill v8 - Per-agent reward decomposition
-# Key change vs v7: per-agent-reward=true (row-wise credit assignment)
+# Triangle Fill v9 - Rebalanced reward: balanced global shape and local spacing
+# Key changes vs v8:
+#   - formation-w: 5.0 -> 2.0
+#   - spacing-w: 1.0 -> 2.0
+#   - safe-action-w: 0.02 -> 0.0
+# Chosen from short-run reward ablations as the best balanced early-learning setting.
 device: cuda
 num-envs: 512
 n-agents: 30
@@ -27,18 +31,18 @@ ent-coef: 0.02
 ent-coef-end: 0.002
 ent-decay-updates: 3000
 
-# Per-agent reward (core change)
+# Per-agent reward
 per-agent-reward: true
 
 # Reward weights
-formation-w: 5.0
-spacing-w: 1.0
+formation-w: 2.0
+spacing-w: 2.0
 target-spacing-mm: 45.0
 progress-reward: false
 success-bonus: 0.0
 success-threshold: 0.05
 safe-collision-w: 0.5
-safe-action-w: 0.02
+safe-action-w: 0.0
 
 formation-sinkhorn-tau: 0.001
 formation-sinkhorn-iters: 30
@@ -51,4 +55,4 @@ seed: 42
 log-every: 10
 save-every: 200
 tensorboard: true
-out-dir: runs/triangle_fill_v8
+out-dir: runs/triangle_fill_v9
