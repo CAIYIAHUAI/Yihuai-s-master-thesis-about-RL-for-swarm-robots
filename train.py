@@ -114,6 +114,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--formation-template-seed", type=int, default=0)
     p.add_argument("--target-spacing-mm", type=float, default=45.0, help="Target nearest-neighbor distance in mm.")
     p.add_argument("--spacing-w", type=float, default=1.0)
+    p.add_argument("--lattice-w", type=float, default=0.0)
+    p.add_argument("--lattice-k", type=int, default=6)
     p.add_argument(
         "--per-agent-reward",
         action=argparse.BooleanOptionalAction,
@@ -156,6 +158,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Include goal-relative observation (position relative to formation center).",
+    )
+    p.add_argument(
+        "--fast-collisions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the project-local VMAS sphere collision fast path for triangle_fill.",
     )
 
     # Resume
@@ -295,6 +303,10 @@ def metric_keys_for_training() -> List[str]:
     return [
         "formation_loss",
         "spacing_loss",
+        "lattice_loss",
+        "local_spacing_progress_mean",
+        "local_lattice_progress_mean",
+        "global_shape_progress_mean",
         "formation_score",
         "collision_mean",
         "action_mean",
@@ -449,6 +461,8 @@ def main() -> None:
         "formation_template_seed": int(args.formation_template_seed),
         "target_spacing_mm": float(args.target_spacing_mm),
         "spacing_w": float(args.spacing_w),
+        "lattice_w": float(args.lattice_w),
+        "lattice_k": int(args.lattice_k),
         "share_reward": not bool(args.per_agent_reward),
         "progress_reward": bool(args.progress_reward),
         "success_bonus": float(args.success_bonus),
@@ -456,6 +470,7 @@ def main() -> None:
         "safe_collision_w": float(args.safe_collision_w),
         "safe_action_w": float(args.safe_action_w),
         "torch_compile": bool(args.torch_compile),
+        "fast_collisions": bool(args.fast_collisions),
     }
     if (args.pile_center_y_mm_min is None) ^ (args.pile_center_y_mm_max is None):
         raise ValueError("--pile-center-y-mm-min and --pile-center-y-mm-max must be set together")

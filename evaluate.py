@@ -72,12 +72,23 @@ def parse_args() -> argparse.Namespace:
         help="Override scenario observation normalization (default: checkpoint/scenario setting).",
     )
     p.add_argument("--formation-w", type=float, default=None)
+    p.add_argument("--spacing-w", type=float, default=None)
+    p.add_argument("--lattice-w", type=float, default=None)
+    p.add_argument("--lattice-k", type=int, default=None)
     p.add_argument("--formation-sinkhorn-tau", type=float, default=None)
     p.add_argument("--formation-sinkhorn-iters", type=int, default=None)
     p.add_argument("--formation-eps", type=float, default=None)
     p.add_argument("--formation-template-seed", type=int, default=None)
+    p.add_argument("--progress-reward", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--per-agent-reward", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--safe-collision-w", type=float, default=None)
     p.add_argument("--safe-action-w", type=float, default=None)
+    p.add_argument(
+        "--fast-collisions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the runtime VMAS sphere collision fast path.",
+    )
     return p.parse_args()
 
 
@@ -97,7 +108,19 @@ class Actor(nn.Module):
 
 
 def metric_keys_for_eval() -> List[str]:
-    return ["formation_loss", "formation_score", "collision_mean", "action_mean", "sinkhorn_entropy", "speed_mean"]
+    return [
+        "formation_loss",
+        "spacing_loss",
+        "lattice_loss",
+        "local_spacing_progress_mean",
+        "local_lattice_progress_mean",
+        "global_shape_progress_mean",
+        "formation_score",
+        "collision_mean",
+        "action_mean",
+        "sinkhorn_entropy",
+        "speed_mean",
+    ]
 
 
 def _stack_metric(info0: dict, key: str) -> Optional[torch.Tensor]:
@@ -155,12 +178,18 @@ def main() -> None:
         "turn_v_frac",
         "normalize_obs",
         "formation_w",
+        "spacing_w",
+        "lattice_w",
+        "lattice_k",
         "formation_sinkhorn_tau",
         "formation_sinkhorn_iters",
         "formation_eps",
         "formation_template_seed",
+        "progress_reward",
+        "share_reward",
         "safe_collision_w",
         "safe_action_w",
+        "fast_collisions",
     ]:
         v = ckpt_args.get(key, None)
         if v is not None:
@@ -181,6 +210,10 @@ def main() -> None:
         tvf = ckpt_args.get("turn_v_frac", None)
         if tvf is not None:
             scenario_kwargs["turn_v_frac"] = float(tvf)
+    if "share_reward" not in scenario_kwargs:
+        per_agent_reward = ckpt_args.get("per_agent_reward", None)
+        if per_agent_reward is not None:
+            scenario_kwargs["share_reward"] = not bool(per_agent_reward)
     # Backward-compat: some runs store the Y-range as CLI args instead of the derived tuple.
     if "pile_center_y_mm_range" not in scenario_kwargs:
         y0 = ckpt_args.get("pile_center_y_mm_min", None)
@@ -206,6 +239,12 @@ def main() -> None:
         scenario_kwargs["normalize_obs"] = bool(args.normalize_obs)
     if args.formation_w is not None:
         scenario_kwargs["formation_w"] = float(args.formation_w)
+    if args.spacing_w is not None:
+        scenario_kwargs["spacing_w"] = float(args.spacing_w)
+    if args.lattice_w is not None:
+        scenario_kwargs["lattice_w"] = float(args.lattice_w)
+    if args.lattice_k is not None:
+        scenario_kwargs["lattice_k"] = int(args.lattice_k)
     if args.formation_sinkhorn_tau is not None:
         scenario_kwargs["formation_sinkhorn_tau"] = float(args.formation_sinkhorn_tau)
     if args.formation_sinkhorn_iters is not None:
@@ -214,10 +253,16 @@ def main() -> None:
         scenario_kwargs["formation_eps"] = float(args.formation_eps)
     if args.formation_template_seed is not None:
         scenario_kwargs["formation_template_seed"] = int(args.formation_template_seed)
+    if args.progress_reward is not None:
+        scenario_kwargs["progress_reward"] = bool(args.progress_reward)
+    if args.per_agent_reward is not None:
+        scenario_kwargs["share_reward"] = not bool(args.per_agent_reward)
     if args.safe_collision_w is not None:
         scenario_kwargs["safe_collision_w"] = float(args.safe_collision_w)
     if args.safe_action_w is not None:
         scenario_kwargs["safe_action_w"] = float(args.safe_action_w)
+    if args.fast_collisions is not None:
+        scenario_kwargs["fast_collisions"] = bool(args.fast_collisions)
 
     # Backward-compat: if the checkpoint expects a larger obs_dim than the current scenario outputs,
     # ask the scenario to pad observations with zeros so the Actor can run.

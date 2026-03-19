@@ -6,9 +6,12 @@ from vmas.simulator.dynamics.common import Dynamics
 from vmas.simulator.core import Agent, Sphere, World
 from vmas.simulator.scenario import BaseScenario
 from vmas.simulator.utils import Color, ScenarioUtils
+from utils import patch_world_for_fast_sphere_collisions
 from utils.triangle_reward import (
     build_triangle_template,
+    build_template_knn_signatures,
     make_formation_soft_permutation_fn,
+    per_agent_lattice_loss,
     scale_invariant_distance_loss,
     squared_distance_matrix_batched,
 )
@@ -106,6 +109,8 @@ class Scenario(BaseScenario):
         self.formation_w = float(kwargs.pop("formation_w", 1.0))
         self.target_spacing_mm = float(kwargs.pop("target_spacing_mm", 45.0))
         self.spacing_w = float(kwargs.pop("spacing_w", 1.0))
+        self.lattice_w = float(kwargs.pop("lattice_w", 0.0))
+        self.lattice_k = int(kwargs.pop("lattice_k", 6))
         self.progress_reward = bool(kwargs.pop("progress_reward", True))
         self.success_bonus = float(kwargs.pop("success_bonus", 0.05))
         self.success_threshold = float(kwargs.pop("success_threshold", 0.05))
@@ -116,6 +121,7 @@ class Scenario(BaseScenario):
         self.safe_collision_w = float(kwargs.pop("safe_collision_w", 0.5))
         self.safe_action_w = float(kwargs.pop("safe_action_w", 0.02))
         self.torch_compile = bool(kwargs.pop("torch_compile", False))
+        self.fast_collisions = bool(kwargs.pop("fast_collisions", False))
 
         # Spawn (pile) config for formation training.
         # We keep the default spawn below origin to avoid immediate dense collisions.
@@ -191,6 +197,13 @@ class Scenario(BaseScenario):
                     )
                     world.add_agent(agent)
 
+        self.fast_collisions_enabled = False
+        if self.fast_collisions:
+            enabled, reason = patch_world_for_fast_sphere_collisions(world)
+            self.fast_collisions_enabled = enabled
+            status = "enabled" if enabled else "skipped"
+            print(f"triangle_fill fast collisions {status}: {reason}")
+
         # Build deterministic formation template once (shape only; not tied to world coordinates).
         tmpl = build_triangle_template(
             n_agents=self.n_agents,
@@ -204,6 +217,14 @@ class Scenario(BaseScenario):
             eps=self.formation_eps,
             compile_enabled=self.torch_compile and device_type == "cuda",
         )
+        if self.lattice_w > 0.0:
+            self._template_knn_sigs = build_template_knn_signatures(
+                tmpl,
+                k=self.lattice_k,
+                eps=self.formation_eps,
+            )
+        else:
+            self._template_knn_sigs = None
         self.target_spacing = self.target_spacing_mm * self.mm_to_unit
 
         self._rew_per_agent = None
@@ -211,6 +232,9 @@ class Scenario(BaseScenario):
         self._info_cache = None
         self._prev_struct_loss = None
         self._prev_spacing_loss = None
+        self._prev_lattice_loss = None
+        self._prev_per_agent_spacing_loss = None
+        self._prev_per_agent_lattice_loss = None
 
         return world
 
@@ -226,6 +250,9 @@ class Scenario(BaseScenario):
             self._info_cache = None
             self._prev_struct_loss = None
             self._prev_spacing_loss = None
+            self._prev_lattice_loss = None
+            self._prev_per_agent_spacing_loss = None
+            self._prev_per_agent_lattice_loss = None
             return
 
         # Resolve pile center for this env.
@@ -269,6 +296,12 @@ class Scenario(BaseScenario):
             self._prev_struct_loss[env_index] = -1.0
         if self._prev_spacing_loss is not None:
             self._prev_spacing_loss[env_index] = -1.0
+        if self._prev_lattice_loss is not None:
+            self._prev_lattice_loss[env_index] = -1.0
+        if self._prev_per_agent_spacing_loss is not None:
+            self._prev_per_agent_spacing_loss[env_index] = -1.0
+        if self._prev_per_agent_lattice_loss is not None:
+            self._prev_per_agent_lattice_loss[env_index] = -1.0
 
     def _compute_metrics(self):
         pos = torch.stack([a.state.pos for a in self.world.agents], dim=1) # [B,N,2] collect all robots' (x,y)
@@ -293,7 +326,15 @@ class Scenario(BaseScenario):
 
     def _formation_terms(
         self, pos: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Return global logging terms plus per-agent formation terms."""
         dist2 = squared_distance_matrix_batched(pos)  # [B,N,N]
         soft_perm = self._formation_soft_perm(dist2, self._formation_template_dist2)
@@ -316,8 +357,28 @@ class Scenario(BaseScenario):
         per_agent_spacing_loss = ((per_agent_3nn / max(self.target_spacing, 1e-8)) - 1.0).pow(2)
         spacing_loss = per_agent_spacing_loss.mean(dim=-1)
 
+        if self._template_knn_sigs is not None:
+            per_agent_lattice = per_agent_lattice_loss(
+                dist_mat,
+                self._template_knn_sigs,
+                k=self.lattice_k,
+                eps=self.formation_eps,
+            )
+            lattice_loss = per_agent_lattice.mean(dim=-1)
+        else:
+            per_agent_lattice = torch.zeros_like(per_agent_spacing_loss)
+            lattice_loss = torch.zeros(pos.shape[0], device=pos.device, dtype=dist_mat.dtype)
+
         entropy = -(soft_perm * (soft_perm + self.formation_eps).log()).sum(dim=-1).mean(dim=-1)  # [B]
-        return shape_loss, spacing_loss, entropy, per_agent_shape_loss, per_agent_spacing_loss
+        return (
+            shape_loss,
+            spacing_loss,
+            entropy,
+            per_agent_shape_loss,
+            per_agent_spacing_loss,
+            per_agent_lattice,
+            lattice_loss,
+        )
 
     def _build_formation_info(
         self,
@@ -326,11 +387,19 @@ class Scenario(BaseScenario):
         action_cost: torch.Tensor,
         speed_mean: torch.Tensor,
         sinkhorn_entropy: torch.Tensor,
+        lattice_loss: torch.Tensor,
+        local_spacing_progress_mean: torch.Tensor,
+        local_lattice_progress_mean: torch.Tensor,
+        global_shape_progress_mean: torch.Tensor,
     ) -> dict:
         collision_mean = collision_pen.mean(dim=-1)
         action_mean = action_cost.mean(dim=-1)
         return {
             "formation_loss": formation_loss,
+            "lattice_loss": lattice_loss,
+            "local_spacing_progress_mean": local_spacing_progress_mean,
+            "local_lattice_progress_mean": local_lattice_progress_mean,
+            "global_shape_progress_mean": global_shape_progress_mean,
             "formation_score": torch.exp(-formation_loss),
             "collision_mean": collision_mean,
             # Backward-compatible key for existing tooling.
@@ -350,13 +419,19 @@ class Scenario(BaseScenario):
                 sinkhorn_entropy,
                 per_agent_shape_loss,
                 per_agent_spacing_loss,
+                per_agent_lattice,
+                lattice_loss,
             ) = self._formation_terms(pos)
+            shape_progress = torch.zeros_like(shape_loss)
+            spacing_progress_local = torch.zeros_like(per_agent_spacing_loss)
+            lattice_progress_local = torch.zeros_like(per_agent_lattice)
 
             if self.share_reward:
                 if self.progress_reward:
                     if self._prev_struct_loss is None:
                         self._prev_struct_loss = shape_loss.clone()
                         self._prev_spacing_loss = spacing_loss.clone()
+                        self._prev_lattice_loss = lattice_loss.clone()
 
                     valid_prev = self._prev_struct_loss >= 0.0
                     shape_progress = torch.where(
@@ -365,11 +440,23 @@ class Scenario(BaseScenario):
                     spacing_progress = torch.where(
                         valid_prev, self._prev_spacing_loss - spacing_loss, torch.zeros_like(spacing_loss)
                     )
+                    lattice_progress = torch.where(
+                        valid_prev, self._prev_lattice_loss - lattice_loss, torch.zeros_like(lattice_loss)
+                    )
                     self._prev_struct_loss = shape_loss.clone()
                     self._prev_spacing_loss = spacing_loss.clone()
-                    formation_reward = self.formation_w * shape_progress + self.spacing_w * spacing_progress
+                    self._prev_lattice_loss = lattice_loss.clone()
+                    formation_reward = (
+                        self.formation_w * shape_progress
+                        + self.spacing_w * spacing_progress
+                        + self.lattice_w * lattice_progress
+                    )
                 else:
-                    formation_reward = -self.formation_w * shape_loss - self.spacing_w * spacing_loss
+                    formation_reward = (
+                        -self.formation_w * shape_loss
+                        - self.spacing_w * spacing_loss
+                        - self.lattice_w * lattice_loss
+                    )
 
                 success_mask = (shape_loss < self.success_threshold).float()
                 formation_reward = formation_reward + self.success_bonus * success_mask
@@ -380,19 +467,60 @@ class Scenario(BaseScenario):
                 )
             else:
                 success_mask = (shape_loss < self.success_threshold).float().unsqueeze(-1)
-                per_agent = (
-                    -self.formation_w * per_agent_shape_loss
-                    - self.spacing_w * per_agent_spacing_loss
-                    - self.safe_collision_w * collision_pen
-                    - self.safe_action_w * action_cost
-                    + self.success_bonus * success_mask
-                )
+                if self.progress_reward:
+                    if self._prev_struct_loss is None:
+                        self._prev_struct_loss = shape_loss.clone()
+                    if self._prev_per_agent_spacing_loss is None:
+                        self._prev_per_agent_spacing_loss = per_agent_spacing_loss.clone()
+                    if self._prev_per_agent_lattice_loss is None:
+                        self._prev_per_agent_lattice_loss = per_agent_lattice.clone()
+
+                    valid_prev_shape = self._prev_struct_loss >= 0.0
+                    valid_prev_spacing = self._prev_per_agent_spacing_loss >= 0.0
+                    valid_prev_lattice = self._prev_per_agent_lattice_loss >= 0.0
+                    shape_progress = torch.where(
+                        valid_prev_shape, self._prev_struct_loss - shape_loss, torch.zeros_like(shape_loss)
+                    )
+                    spacing_progress_local = torch.where(
+                        valid_prev_spacing,
+                        self._prev_per_agent_spacing_loss - per_agent_spacing_loss,
+                        torch.zeros_like(per_agent_spacing_loss),
+                    )
+                    lattice_progress_local = torch.where(
+                        valid_prev_lattice,
+                        self._prev_per_agent_lattice_loss - per_agent_lattice,
+                        torch.zeros_like(per_agent_lattice),
+                    )
+                    self._prev_struct_loss = shape_loss.clone()
+                    self._prev_per_agent_spacing_loss = per_agent_spacing_loss.clone()
+                    self._prev_per_agent_lattice_loss = per_agent_lattice.clone()
+                    per_agent = (
+                        self.formation_w * shape_progress.unsqueeze(-1)
+                        + self.spacing_w * spacing_progress_local
+                        + self.lattice_w * lattice_progress_local
+                        - self.safe_collision_w * collision_pen
+                        - self.safe_action_w * action_cost
+                        + self.success_bonus * success_mask
+                    )
+                else:
+                    per_agent = (
+                        -self.formation_w * per_agent_shape_loss
+                        - self.spacing_w * per_agent_spacing_loss
+                        - self.lattice_w * per_agent_lattice
+                        - self.safe_collision_w * collision_pen
+                        - self.safe_action_w * action_cost
+                        + self.success_bonus * success_mask
+                    )
             self._info_cache = self._build_formation_info(
                 formation_loss=shape_loss,
                 collision_pen=collision_pen,
                 action_cost=action_cost,
                 speed_mean=speed_mean,
                 sinkhorn_entropy=sinkhorn_entropy,
+                lattice_loss=lattice_loss,
+                local_spacing_progress_mean=spacing_progress_local.mean(dim=-1),
+                local_lattice_progress_mean=lattice_progress_local.mean(dim=-1),
+                global_shape_progress_mean=shape_progress,
             )
             self._info_cache["spacing_loss"] = spacing_loss
 
@@ -621,13 +749,25 @@ class Scenario(BaseScenario):
     def info(self, agent: Agent):
         if self._info_cache is None:
             pos, collision_pen, action_cost, speed_mean = self._compute_metrics()
-            formation_loss, spacing_loss, sinkhorn_entropy, _, _ = self._formation_terms(pos)
+            (
+                formation_loss,
+                spacing_loss,
+                sinkhorn_entropy,
+                _,
+                _,
+                _,
+                lattice_loss,
+            ) = self._formation_terms(pos)
             self._info_cache = self._build_formation_info(
                 formation_loss=formation_loss,
                 collision_pen=collision_pen,
                 action_cost=action_cost,
                 speed_mean=speed_mean,
                 sinkhorn_entropy=sinkhorn_entropy,
+                lattice_loss=lattice_loss,
+                local_spacing_progress_mean=torch.zeros_like(formation_loss),
+                local_lattice_progress_mean=torch.zeros_like(formation_loss),
+                global_shape_progress_mean=torch.zeros_like(formation_loss),
             )
             self._info_cache["spacing_loss"] = spacing_loss
         return self._info_cache

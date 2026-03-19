@@ -37,11 +37,29 @@ def _parse_args() -> argparse.Namespace:
         default=50,
         help="Print mean metrics every N steps (0 disables periodic printing).",
     )
+    p.add_argument(
+        "--fast-collisions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the project-local VMAS sphere collision fast path.",
+    )
     return p.parse_args()
 
 
 def _mean_metrics(info0: dict) -> str:
-    keys = ["formation_loss", "formation_score", "collision_mean", "action_mean", "sinkhorn_entropy", "speed_mean"]
+    keys = [
+        "formation_loss",
+        "spacing_loss",
+        "lattice_loss",
+        "local_spacing_progress_mean",
+        "local_lattice_progress_mean",
+        "global_shape_progress_mean",
+        "formation_score",
+        "collision_mean",
+        "action_mean",
+        "sinkhorn_entropy",
+        "speed_mean",
+    ]
     parts = []
     for k in keys:
         v = info0.get(k, None)
@@ -67,6 +85,7 @@ def main() -> None:
         dict_spaces=False,
         max_steps=args.max_steps,
         seed=args.seed,
+        fast_collisions=bool(args.fast_collisions),
     )
 
     obs = env.reset()

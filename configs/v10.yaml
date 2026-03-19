@@ -1,11 +1,11 @@
-# Triangle Fill v9 - Rebalanced reward: balanced global shape and local spacing
-# Key changes vs v8:
-#   - formation-w: 5.0 -> 2.0
-#   - spacing-w: 1.0 -> 2.0
-#   - safe-action-w: 0.02 -> 0.0
-# Chosen from short-run reward ablations as the best balanced early-learning setting.
+# Triangle Fill v10 - v9 plus mild local lattice shaping
+# Key changes vs v9:
+#   - add local lattice reward term (lattice-w: 0.10)
+#   - num-envs: 512 -> 2048 (better GPU utilization)
+#   - minibatch sizes scaled to match (8192 -> 32768)
+#   - fast-collisions enabled (vectorized collision patch)
 device: cuda
-num-envs: 512
+num-envs: 2048
 n-agents: 30
 max-episode-steps: 1000
 
@@ -22,8 +22,8 @@ gamma: 0.99
 gae-lambda: 0.95
 clip-coef: 0.2
 update-epochs: 4
-minibatch-size-policy: 8192
-minibatch-size-value: 8192
+minibatch-size-policy: 32768
+minibatch-size-value: 32768
 value-clip: 0.2
 max-grad-norm: 0.5
 
@@ -31,12 +31,12 @@ ent-coef: 0.02
 ent-coef-end: 0.002
 ent-decay-updates: 3000
 
-# Per-agent reward
 per-agent-reward: true
 
-# Reward weights
 formation-w: 2.0
 spacing-w: 2.0
+lattice-w: 0.10
+lattice-k: 6
 target-spacing-mm: 45.0
 progress-reward: false
 success-bonus: 0.0
@@ -50,9 +50,10 @@ formation-sinkhorn-iters: 30
 amp: true
 amp-dtype: bf16
 torch-compile: true
+fast-collisions: true
 seed: 42
 
 log-every: 10
 save-every: 200
 tensorboard: true
-out-dir: runs/triangle_fill_v9
+out-dir: runs/triangle_fill_v10
