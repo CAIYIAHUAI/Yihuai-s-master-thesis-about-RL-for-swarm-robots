@@ -109,9 +109,23 @@ class Scenario(BaseScenario):
         self.formation_w = float(kwargs.pop("formation_w", 1.0))
         self.target_spacing_mm = float(kwargs.pop("target_spacing_mm", 45.0))
         self.spacing_w = float(kwargs.pop("spacing_w", 1.0))
+        # Flat-bottom spacing band:
+        # - default lo=hi=1.0 preserves the legacy squared error exactly
+        # - wider bands can be enabled in configs to treat spacing as a soft constraint
+        self.spacing_ratio_lo = float(kwargs.pop("spacing_ratio_lo", 1.0))
+        self.spacing_ratio_hi = float(kwargs.pop("spacing_ratio_hi", 1.0))
+        self.boundary_spacing_scale = float(kwargs.pop("boundary_spacing_scale", 1.0))
+        # Optional direct shape reward hook. Default 0.0 keeps legacy reward behavior.
+        self.triangle_w = float(kwargs.pop("triangle_w", 0.0))
+        self.boundary_frac = float(kwargs.pop("boundary_frac", 0.35))
+        self.corner_peak_ratio = float(kwargs.pop("corner_peak_ratio", 1.15))
+        self.triangle_shape_w_tri = float(kwargs.pop("triangle_shape_w_tri", 0.45))
+        self.triangle_shape_w_corner = float(kwargs.pop("triangle_shape_w_corner", 0.30))
+        self.triangle_shape_w_straight = float(kwargs.pop("triangle_shape_w_straight", 0.25))
         self.lattice_w = float(kwargs.pop("lattice_w", 0.0))
         self.lattice_k = int(kwargs.pop("lattice_k", 6))
         self.progress_reward = bool(kwargs.pop("progress_reward", True))
+        self.mixed_reward = bool(kwargs.pop("mixed_reward", False))
         self.success_bonus = float(kwargs.pop("success_bonus", 0.05))
         self.success_threshold = float(kwargs.pop("success_threshold", 0.05))
         self.formation_sinkhorn_tau = float(kwargs.pop("formation_sinkhorn_tau", 0.001))
@@ -149,8 +163,13 @@ class Scenario(BaseScenario):
 
         # Goal-relative observation: include position/heading relative to formation center
         self.obs_include_goal_rel = bool(kwargs.pop("obs_include_goal_rel", False))
+        # In GNN ablations, keep observations self-only so all neighbor information must flow through graph messages.
+        self.gnn_obs_self_only = bool(kwargs.pop("gnn_obs_self_only", False))
         # Formation center (where robots should converge to form triangle)
         self.formation_center_mm = kwargs.pop("formation_center_mm", (0.0, 0.0))
+
+        if self.mixed_reward and self.progress_reward:
+            raise ValueError("mixed_reward currently requires progress_reward=False.")
 
         ScenarioUtils.check_kwargs_consumed(kwargs)
 
@@ -334,6 +353,10 @@ class Scenario(BaseScenario):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """Return global logging terms plus per-agent formation terms."""
         dist2 = squared_distance_matrix_batched(pos)  # [B,N,N]
@@ -354,9 +377,21 @@ class Scenario(BaseScenario):
         k = min(3, pos.shape[1] - 1)
         knn = dist_mat.topk(k, dim=-1, largest=False).values
         per_agent_3nn = knn.mean(dim=-1)
-        per_agent_spacing_loss = ((per_agent_3nn / max(self.target_spacing, 1e-8)) - 1.0).pow(2)
-        spacing_loss = per_agent_spacing_loss.mean(dim=-1)
-
+        ratio = per_agent_3nn / max(self.target_spacing, 1e-8)
+        spacing_lo = self.spacing_ratio_lo
+        spacing_hi = self.spacing_ratio_hi
+        if spacing_lo < spacing_hi:
+            per_agent_spacing_loss = torch.where(
+                ratio < spacing_lo,
+                (ratio - spacing_lo).pow(2),
+                torch.where(
+                    ratio > spacing_hi,
+                    (ratio - spacing_hi).pow(2),
+                    torch.zeros_like(ratio),
+                ),
+            )
+        else:
+            per_agent_spacing_loss = (ratio - 1.0).pow(2)
         if self._template_knn_sigs is not None:
             per_agent_lattice = per_agent_lattice_loss(
                 dist_mat,
@@ -369,16 +404,108 @@ class Scenario(BaseScenario):
             per_agent_lattice = torch.zeros_like(per_agent_spacing_loss)
             lattice_loss = torch.zeros(pos.shape[0], device=pos.device, dtype=dist_mat.dtype)
 
+        boundary_mask, _, boundary_pos = self._boundary_topk_mask(pos)
+        if self.boundary_spacing_scale != 1.0:
+            boundary_scale = torch.where(
+                boundary_mask,
+                torch.full_like(per_agent_spacing_loss, self.boundary_spacing_scale),
+                torch.ones_like(per_agent_spacing_loss),
+            )
+            per_agent_spacing_loss = per_agent_spacing_loss * boundary_scale
+        spacing_loss = per_agent_spacing_loss.mean(dim=-1)
+        triangularity = self._boundary_triangularity(pos, boundary_pos)
+        boundary_peak_count, boundary_corner_score = self._boundary_corner_score(pos, boundary_pos)
+        boundary_straightness = self._boundary_straightness_score(pos, boundary_pos)
+        triangle_shape_score = (
+            self.triangle_shape_w_tri * triangularity
+            + self.triangle_shape_w_corner * boundary_corner_score
+            + self.triangle_shape_w_straight * boundary_straightness
+        )
         entropy = -(soft_perm * (soft_perm + self.formation_eps).log()).sum(dim=-1).mean(dim=-1)  # [B]
         return (
             shape_loss,
             spacing_loss,
+            triangularity,
             entropy,
             per_agent_shape_loss,
             per_agent_spacing_loss,
             per_agent_lattice,
             lattice_loss,
+            boundary_peak_count,
+            boundary_corner_score,
+            boundary_straightness,
+            triangle_shape_score,
         )
+
+    def _boundary_topk_mask(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select the farthest agents from the centroid as boundary points."""
+        centroid = pos.mean(dim=1, keepdim=True)  # [B, 1, 2]
+        dist_to_centroid = (pos - centroid).norm(dim=-1)  # [B, N]
+        k_boundary = max(3, int(math.ceil(self.boundary_frac * self.n_agents)))
+        k_boundary = min(k_boundary, self.n_agents)
+        _, boundary_idx = dist_to_centroid.topk(k_boundary, dim=-1, largest=True, sorted=False)  # [B, K]
+        boundary_pos = torch.gather(
+            pos,
+            1,
+            boundary_idx.unsqueeze(-1).expand(-1, -1, pos.shape[-1]),
+        )  # [B, K, 2]
+        boundary_mask = torch.zeros(
+            (pos.shape[0], pos.shape[1]),
+            device=pos.device,
+            dtype=torch.bool,
+        )
+        boundary_mask.scatter_(1, boundary_idx, True)
+        return boundary_mask, boundary_idx, boundary_pos
+
+    def _boundary_triangularity(self, pos: torch.Tensor, boundary_pos: torch.Tensor) -> torch.Tensor:
+        """3-fold Fourier coefficient of the boundary radial profile around the global centroid."""
+        centroid = pos.mean(dim=1, keepdim=True)  # [B, 1, 2]
+        boundary_centered = boundary_pos - centroid  # [B, K, 2]
+        r = boundary_centered.norm(dim=-1)  # [B, K]
+        theta = torch.atan2(boundary_centered[:, :, 1], boundary_centered[:, :, 0])  # [B, K]
+        sort_idx = theta.argsort(dim=-1)
+        r_sorted = torch.gather(r, -1, sort_idx)
+        theta_sorted = torch.gather(theta, -1, sort_idx)
+        r_cos3 = (r_sorted * torch.cos(3.0 * theta_sorted)).mean(dim=-1)  # [B]
+        r_sin3 = (r_sorted * torch.sin(3.0 * theta_sorted)).mean(dim=-1)  # [B]
+        r_mean = r.mean(dim=-1).clamp_min(1e-8)  # [B]
+        return torch.sqrt(r_cos3.square() + r_sin3.square()) / r_mean
+
+    def _boundary_corner_score(self, pos: torch.Tensor, boundary_pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Count prominent peaks in the sorted boundary radial profile."""
+        centroid = pos.mean(dim=1, keepdim=True)  # [B, 1, 2]
+        boundary_centered = boundary_pos - centroid  # [B, K, 2]
+        r = boundary_centered.norm(dim=-1)  # [B, K]
+        theta = torch.atan2(boundary_centered[:, :, 1], boundary_centered[:, :, 0])  # [B, K]
+        sort_idx = theta.argsort(dim=-1)
+        r_sorted = torch.gather(r, -1, sort_idx)
+        r_mean = r_sorted.mean(dim=-1, keepdim=True).clamp_min(1e-8)
+        r_prev = torch.roll(r_sorted, shifts=1, dims=-1)
+        r_next = torch.roll(r_sorted, shifts=-1, dims=-1)
+        peak_thresh = r_mean * self.corner_peak_ratio
+        is_peak = (r_sorted > r_prev) & (r_sorted >= r_next) & (r_sorted > peak_thresh)
+        peak_count = is_peak.float().sum(dim=-1)
+        corner_score = torch.exp(-0.5 * (peak_count - 3.0).square())
+        return peak_count, corner_score
+
+    def _boundary_straightness_score(self, pos: torch.Tensor, boundary_pos: torch.Tensor) -> torch.Tensor:
+        """Measure whether boundary tangents align with three dominant edge directions."""
+        centroid = pos.mean(dim=1, keepdim=True)  # [B, 1, 2]
+        boundary_centered = boundary_pos - centroid  # [B, K, 2]
+        theta = torch.atan2(boundary_centered[:, :, 1], boundary_centered[:, :, 0])  # [B, K]
+        sort_idx = theta.argsort(dim=-1)
+        boundary_sorted = torch.gather(
+            boundary_pos,
+            1,
+            sort_idx.unsqueeze(-1).expand(-1, -1, boundary_pos.shape[-1]),
+        )  # [B, K, 2]
+        prev_pts = torch.roll(boundary_sorted, shifts=1, dims=1)
+        next_pts = torch.roll(boundary_sorted, shifts=-1, dims=1)
+        tangent = next_pts - prev_pts  # [B, K, 2]
+        phi = torch.atan2(tangent[:, :, 1], tangent[:, :, 0])  # [B, K]
+        orient_cos6 = torch.cos(6.0 * phi).mean(dim=-1)
+        orient_sin6 = torch.sin(6.0 * phi).mean(dim=-1)
+        return torch.sqrt(orient_cos6.square() + orient_sin6.square()).clamp(0.0, 1.0)
 
     def _build_formation_info(
         self,
@@ -388,6 +515,11 @@ class Scenario(BaseScenario):
         speed_mean: torch.Tensor,
         sinkhorn_entropy: torch.Tensor,
         lattice_loss: torch.Tensor,
+        triangularity: torch.Tensor,
+        boundary_peak_count: torch.Tensor,
+        boundary_corner_score: torch.Tensor,
+        boundary_straightness: torch.Tensor,
+        triangle_shape_score: torch.Tensor,
         local_spacing_progress_mean: torch.Tensor,
         local_lattice_progress_mean: torch.Tensor,
         global_shape_progress_mean: torch.Tensor,
@@ -401,6 +533,12 @@ class Scenario(BaseScenario):
             "local_lattice_progress_mean": local_lattice_progress_mean,
             "global_shape_progress_mean": global_shape_progress_mean,
             "formation_score": torch.exp(-formation_loss),
+            "triangularity": triangularity,
+            "boundary_triangularity": triangularity,
+            "boundary_peak_count": boundary_peak_count,
+            "boundary_corner_score": boundary_corner_score,
+            "boundary_straightness": boundary_straightness,
+            "triangle_shape_score": triangle_shape_score,
             "collision_mean": collision_mean,
             # Backward-compatible key for existing tooling.
             "collisions_mean": collision_mean,
@@ -416,17 +554,32 @@ class Scenario(BaseScenario):
             (
                 shape_loss,
                 spacing_loss,
+                triangularity,
                 sinkhorn_entropy,
                 per_agent_shape_loss,
                 per_agent_spacing_loss,
                 per_agent_lattice,
                 lattice_loss,
+                boundary_peak_count,
+                boundary_corner_score,
+                boundary_straightness,
+                triangle_shape_score,
             ) = self._formation_terms(pos)
             shape_progress = torch.zeros_like(shape_loss)
             spacing_progress_local = torch.zeros_like(per_agent_spacing_loss)
             lattice_progress_local = torch.zeros_like(per_agent_lattice)
 
-            if self.share_reward:
+            if self.mixed_reward:
+                success_mask = (shape_loss < self.success_threshold).float().unsqueeze(-1)
+                per_agent = (
+                    -self.formation_w * shape_loss.unsqueeze(-1)
+                    - self.spacing_w * per_agent_spacing_loss
+                    - self.lattice_w * per_agent_lattice
+                    - self.safe_collision_w * collision_pen
+                    - self.safe_action_w * action_cost
+                    + self.success_bonus * success_mask
+                )
+            elif self.share_reward:
                 if self.progress_reward:
                     if self._prev_struct_loss is None:
                         self._prev_struct_loss = shape_loss.clone()
@@ -511,6 +664,8 @@ class Scenario(BaseScenario):
                         - self.safe_action_w * action_cost
                         + self.success_bonus * success_mask
                     )
+            if self.triangle_w > 0.0:
+                per_agent = per_agent + self.triangle_w * triangle_shape_score.unsqueeze(-1)
             self._info_cache = self._build_formation_info(
                 formation_loss=shape_loss,
                 collision_pen=collision_pen,
@@ -518,18 +673,23 @@ class Scenario(BaseScenario):
                 speed_mean=speed_mean,
                 sinkhorn_entropy=sinkhorn_entropy,
                 lattice_loss=lattice_loss,
+                triangularity=triangularity,
+                boundary_peak_count=boundary_peak_count,
+                boundary_corner_score=boundary_corner_score,
+                boundary_straightness=boundary_straightness,
+                triangle_shape_score=triangle_shape_score,
                 local_spacing_progress_mean=spacing_progress_local.mean(dim=-1),
                 local_lattice_progress_mean=lattice_progress_local.mean(dim=-1),
                 global_shape_progress_mean=shape_progress,
             )
             self._info_cache["spacing_loss"] = spacing_loss
 
-            if self.share_reward:
+            if self.share_reward and not self.mixed_reward:
                 self._shared_rew = per_agent.mean(dim=-1)  # [B]
             else:
                 self._rew_per_agent = per_agent
 
-        if self.share_reward:
+        if self.share_reward and not self.mixed_reward:
             return self._shared_rew
 
         idx = self.world.agents.index(agent)
@@ -542,6 +702,8 @@ class Scenario(BaseScenario):
         - self._neighbor_count: [B, N, 1]
         - self._top_k_neighbors: [B, N, K, 4] with
           [dx_body, dy_body, dist, valid]
+        - self._local_geom_features: [B, N, 6] with
+          [max_gap_size, gap_dir_cos, gap_dir_sin, linearity, tangent_cos2, tangent_sin2]
         """
         pos = torch.stack([a.state.pos for a in self.world.agents], dim=1)  # [B, N, 2]
         rot = torch.stack([a.state.rot for a in self.world.agents], dim=1)  # [B, N, 1]
@@ -623,21 +785,122 @@ class Scenario(BaseScenario):
         else:
             self._top_k_neighbors = topk_features  # [B, N, K, 4]
 
+        # 14. Local role + boundary-shape features derived from Top-K body-frame neighbors.
+        valid_mask = topk_valid > 0.5  # [B, N, actual_k]
+        n_valid = valid_mask.sum(dim=-1)  # [B, N]
+        n_valid_f = n_valid.to(topk_rel_pos_body.dtype)
+        n_valid_safe = n_valid_f.clamp_min(1.0)
+
+        dx_body = topk_rel_pos_body[:, :, :, 0]  # [B, N, actual_k]
+        dy_body = topk_rel_pos_body[:, :, :, 1]  # [B, N, actual_k]
+        angles = torch.atan2(dy_body, dx_body)  # [B, N, actual_k], [-pi, pi]
+
+        inf_fill = torch.full_like(angles, BIG)
+        angles_sorted, _ = torch.sort(torch.where(valid_mask, angles, inf_fill), dim=-1)
+
+        if actual_k > 0:
+            arange_km1 = torch.arange(max(actual_k - 1, 1), device=pos.device).view(1, 1, -1)
+            if actual_k > 1:
+                consecutive_gaps = angles_sorted[:, :, 1:] - angles_sorted[:, :, :-1]  # [B, N, actual_k-1]
+                consecutive_valid = arange_km1[:, :, : actual_k - 1] < (n_valid - 1).unsqueeze(-1)
+                consecutive_gaps = torch.where(
+                    consecutive_valid,
+                    consecutive_gaps,
+                    torch.zeros_like(consecutive_gaps),
+                )
+            else:
+                consecutive_gaps = torch.zeros_like(angles_sorted)
+
+            last_valid_idx = (n_valid - 1).clamp_min(0).unsqueeze(-1)  # [B, N, 1]
+            first_angle = angles_sorted[:, :, 0]
+            last_valid_angle = angles_sorted.gather(-1, last_valid_idx).squeeze(-1)
+            wrap_gap = torch.where(
+                n_valid > 0,
+                first_angle + (2.0 * math.pi) - last_valid_angle,
+                torch.zeros_like(first_angle),
+            )  # [B, N]
+
+            gaps = torch.cat([consecutive_gaps, wrap_gap.unsqueeze(-1)], dim=-1)  # [B, N, actual_k]
+            gap_start_angles = torch.cat(
+                [angles_sorted[:, :, :-1], last_valid_angle.unsqueeze(-1)],
+                dim=-1,
+            )  # [B, N, actual_k]
+
+            max_gap, max_gap_idx = gaps.max(dim=-1)  # [B, N], [B, N]
+            gap_start = gap_start_angles.gather(-1, max_gap_idx.unsqueeze(-1)).squeeze(-1)
+            gap_center = gap_start + 0.5 * max_gap
+            max_gap_size = torch.where(
+                n_valid > 0,
+                (max_gap / (2.0 * math.pi)).clamp(0.0, 1.0),
+                torch.zeros_like(max_gap),
+            )
+            gap_dir_cos = max_gap_size * torch.cos(gap_center)
+            gap_dir_sin = max_gap_size * torch.sin(gap_center)
+        else:
+            max_gap_size = torch.zeros_like(n_valid_f)
+            gap_dir_cos = torch.zeros_like(n_valid_f)
+            gap_dir_sin = torch.zeros_like(n_valid_f)
+
+        # Local line structure from the covariance of valid body-frame neighbor coordinates.
+        mean_x = dx_body.sum(dim=-1) / n_valid_safe  # [B, N]
+        mean_y = dy_body.sum(dim=-1) / n_valid_safe  # [B, N]
+        centered_x = (dx_body - mean_x.unsqueeze(-1)) * topk_valid
+        centered_y = (dy_body - mean_y.unsqueeze(-1)) * topk_valid
+
+        xx = (centered_x * centered_x).sum(dim=-1) / n_valid_safe  # [B, N]
+        yy = (centered_y * centered_y).sum(dim=-1) / n_valid_safe  # [B, N]
+        xy = (centered_x * centered_y).sum(dim=-1) / n_valid_safe  # [B, N]
+
+        delta = torch.sqrt((xx - yy).square() + 4.0 * xy.square() + self.formation_eps)
+        trace = xx + yy
+        linearity = torch.where(
+            n_valid >= 2,
+            (delta / (trace + self.formation_eps)).clamp(0.0, 1.0),
+            torch.zeros_like(trace),
+        )
+
+        tangent_cos2 = torch.where(
+            n_valid >= 2,
+            linearity * ((xx - yy) / delta),
+            torch.zeros_like(linearity),
+        )
+        tangent_sin2 = torch.where(
+            n_valid >= 2,
+            linearity * ((2.0 * xy) / delta),
+            torch.zeros_like(linearity),
+        )
+
+        self._local_geom_features = torch.stack(
+            [
+                max_gap_size,
+                gap_dir_cos,
+                gap_dir_sin,
+                linearity,
+                tangent_cos2,
+                tangent_sin2,
+            ],
+            dim=-1,
+        )  # [B, N, 6]
+
 
     def observation(self, agent: Agent):
         """Per-agent local observation for formation task.
 
-        Feature layout:
+        Default feature layout:
         - vel_body: [2]
         - neighbor_count: [1]
         - top_k_neighbors: [K*4], each neighbor is [dx_body, dy_body, dist, valid]
+        - local_geom_features: [6], each feature is
+          [max_gap_size, gap_dir_cos, gap_dir_sin, linearity, tangent_cos2, tangent_sin2]
 
-        Total dim = 3 + K*4.
+        If gnn_obs_self_only=True, only self features are exposed here:
+        - vel_body: [2]
+        - optional goal-relative features: [4]
         """
 
         # 第一次调用agent_0的observation时重新计算缓存
         is_first = agent == self.world.agents[0]
-        if is_first or not hasattr(self, '_neighbor_count'):
+        if (not self.gnn_obs_self_only) and (is_first or not hasattr(self, '_neighbor_count')):
             self._compute_neighbor_features_cache()
 
         idx = self.world.agents.index(agent)
@@ -655,55 +918,63 @@ class Scenario(BaseScenario):
         vy_body = -sin_theta.squeeze(-1) * vel_world[:, 0] + cos_theta.squeeze(-1) * vel_world[:, 1]  # [B]
         vel_body = torch.stack([vx_body, vy_body], dim=-1)  # [B, 2]
 
-        # 2. 提取邻居数量
-        neighbor_count = self._neighbor_count[:, idx, :]  # [B, 1]
-
-        # 3. 提取Top-K邻居信息（已经是body frame）
-        top_k_neighbors = self._top_k_neighbors[:, idx, :, :]  # [B, K, 4]
-
-        # 展平邻居信息：[B, K, 4] -> [B, K*4]
-        K = self.obs_top_k_neighbors
-        top_k_neighbors_flat = top_k_neighbors.reshape(top_k_neighbors.shape[0], K * 4)  # [B, K*4]
-
-        # 5. 归一化（保持网络输入在 ~O(1) 数量级）
+        # 2. 归一化（保持网络输入在 ~O(1) 数量级）
         if self.normalize_obs:
             # vel_body：按最大速度v0归一化
             vel_body_n = vel_body / max(self.v0, 1e-8)  # ~[-1, 1]
-
-            # neighbor_count：按最大可能邻居数归一化
-            neighbor_count_n = neighbor_count / max(float(self.n_agents - 1), 1.0)  # [0, 1]
-
-            # Top-K邻居：展开成 [B, K, 4] 方便处理
-            top_k_neighbors_expanded = top_k_neighbors_flat.reshape(-1, K, 4)
-
-            # dx_body, dy_body: 按通信范围comm_r归一化
-            top_k_neighbors_expanded[:, :, 0] = top_k_neighbors_expanded[:, :, 0] / max(self.comm_r, 1e-8)  # dx_body
-            top_k_neighbors_expanded[:, :, 1] = top_k_neighbors_expanded[:, :, 1] / max(self.comm_r, 1e-8)  # dy_body
-
-            # dist: 按通信范围comm_r归一化
-            top_k_neighbors_expanded[:, :, 2] = top_k_neighbors_expanded[:, :, 2] / max(self.comm_r, 1e-8)
-
-            # valid: 已经是[0,1]，无需归一化（第4个维度保持不变）
-
-            # 重新展平
-            top_k_neighbors_flat_n = top_k_neighbors_expanded.reshape(-1, K * 4)  # [B, K*4]
         else:
             vel_body_n = vel_body
-            neighbor_count_n = neighbor_count
-            top_k_neighbors_flat_n = top_k_neighbors_flat
 
-        # 4. 构建最终观测向量
-        obs = torch.cat([
-            vel_body_n,                 # [2] 自身速度（body frame）
-            neighbor_count_n,           # [1] 邻居数量
-            top_k_neighbors_flat_n,     # [K*4] Top-K邻居信息（展平，body frame）
-        ], dim=-1)  # Total dim / 总维度：3 + K*4
+        if self.gnn_obs_self_only:
+            obs = vel_body_n
+        else:
+            # 3. 提取邻居数量
+            neighbor_count = self._neighbor_count[:, idx, :]  # [B, 1]
+
+            # 4. 提取Top-K邻居信息（已经是body frame）
+            top_k_neighbors = self._top_k_neighbors[:, idx, :, :]  # [B, K, 4]
+            local_geom_features = self._local_geom_features[:, idx, :]  # [B, 6]
+
+            # 展平邻居信息：[B, K, 4] -> [B, K*4]
+            K = self.obs_top_k_neighbors
+            top_k_neighbors_flat = top_k_neighbors.reshape(top_k_neighbors.shape[0], K * 4)  # [B, K*4]
+            local_geom_features_n = local_geom_features
+
+            if self.normalize_obs:
+                # neighbor_count：按最大可能邻居数归一化
+                neighbor_count_n = neighbor_count / max(float(self.n_agents - 1), 1.0)  # [0, 1]
+
+                # Top-K邻居：展开成 [B, K, 4] 方便处理
+                top_k_neighbors_expanded = top_k_neighbors_flat.reshape(-1, K, 4)
+
+                # dx_body, dy_body: 按通信范围comm_r归一化
+                top_k_neighbors_expanded[:, :, 0] = top_k_neighbors_expanded[:, :, 0] / max(self.comm_r, 1e-8)  # dx_body
+                top_k_neighbors_expanded[:, :, 1] = top_k_neighbors_expanded[:, :, 1] / max(self.comm_r, 1e-8)  # dy_body
+
+                # dist: 按通信范围comm_r归一化
+                top_k_neighbors_expanded[:, :, 2] = top_k_neighbors_expanded[:, :, 2] / max(self.comm_r, 1e-8)
+
+                # valid: 已经是[0,1]，无需归一化（第4个维度保持不变）
+
+                # 重新展平
+                top_k_neighbors_flat_n = top_k_neighbors_expanded.reshape(-1, K * 4)  # [B, K*4]
+            else:
+                neighbor_count_n = neighbor_count
+                top_k_neighbors_flat_n = top_k_neighbors_flat
+
+            # 5. 构建最终观测向量
+            obs = torch.cat([
+                vel_body_n,                 # [2] 自身速度（body frame）
+                neighbor_count_n,           # [1] 邻居数量
+                top_k_neighbors_flat_n,     # [K*4] Top-K邻居信息（展平，body frame）
+                local_geom_features_n,      # [6] 局部角色/边界形状特征
+            ], dim=-1)  # Total dim / 总维度：9 + K*4
 
         # 6. Optional: include goal-relative observation (position relative to formation center)
         if self.obs_include_goal_rel:
             # Position relative to formation center (world frame)
             pos_world = agent.state.pos  # [B, 2]
-            goal_rel_world = pos_world - self.formation_center.unsqueeze(0)  # [B, 2]
+            goal_rel_world = self.formation_center.unsqueeze(0) - pos_world  # [B, 2]
             
             # Convert to body frame
             rot = agent.state.rot  # [B, 1]
@@ -730,7 +1001,7 @@ class Scenario(BaseScenario):
                 heading_error_n = heading_error
             
             goal_features = torch.cat([goal_rel_body_n, goal_dist_n, heading_error_n], dim=-1)  # [B, 4]
-            obs = torch.cat([obs, goal_features], dim=-1)  # [B, 3+K*4 + 4]
+            obs = torch.cat([obs, goal_features], dim=-1)
 
         # 5. Optional checkpoint compatibility: fit observation dim to obs_pad_to_dim.
         if self.obs_pad_to_dim is not None:
@@ -752,11 +1023,16 @@ class Scenario(BaseScenario):
             (
                 formation_loss,
                 spacing_loss,
+                triangularity,
                 sinkhorn_entropy,
                 _,
                 _,
                 _,
                 lattice_loss,
+                boundary_peak_count,
+                boundary_corner_score,
+                boundary_straightness,
+                triangle_shape_score,
             ) = self._formation_terms(pos)
             self._info_cache = self._build_formation_info(
                 formation_loss=formation_loss,
@@ -765,6 +1041,11 @@ class Scenario(BaseScenario):
                 speed_mean=speed_mean,
                 sinkhorn_entropy=sinkhorn_entropy,
                 lattice_loss=lattice_loss,
+                triangularity=triangularity,
+                boundary_peak_count=boundary_peak_count,
+                boundary_corner_score=boundary_corner_score,
+                boundary_straightness=boundary_straightness,
+                triangle_shape_score=triangle_shape_score,
                 local_spacing_progress_mean=torch.zeros_like(formation_loss),
                 local_lattice_progress_mean=torch.zeros_like(formation_loss),
                 global_shape_progress_mean=torch.zeros_like(formation_loss),

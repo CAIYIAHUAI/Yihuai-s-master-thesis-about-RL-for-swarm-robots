@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from models.actor import build_actor
 from vmas import make_env
 from vmas.simulator.utils import save_video
 
@@ -73,6 +74,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--formation-w", type=float, default=None)
     p.add_argument("--spacing-w", type=float, default=None)
+    p.add_argument("--boundary-spacing-scale", type=float, default=None)
+    p.add_argument("--spacing-ratio-lo", type=float, default=None)
+    p.add_argument("--spacing-ratio-hi", type=float, default=None)
+    p.add_argument("--triangle-w", type=float, default=None)
+    p.add_argument("--boundary-frac", type=float, default=None)
+    p.add_argument("--corner-peak-ratio", type=float, default=None)
+    p.add_argument("--triangle-shape-w-tri", type=float, default=None)
+    p.add_argument("--triangle-shape-w-corner", type=float, default=None)
+    p.add_argument("--triangle-shape-w-straight", type=float, default=None)
     p.add_argument("--lattice-w", type=float, default=None)
     p.add_argument("--lattice-k", type=int, default=None)
     p.add_argument("--formation-sinkhorn-tau", type=float, default=None)
@@ -92,21 +102,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-class Actor(nn.Module):
-    def __init__(self, obs_dim: int, hidden: int, n_actions: int = 4):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, n_actions),
-        )
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
-
-
 def metric_keys_for_eval() -> List[str]:
     return [
         "formation_loss",
@@ -116,6 +111,12 @@ def metric_keys_for_eval() -> List[str]:
         "local_lattice_progress_mean",
         "global_shape_progress_mean",
         "formation_score",
+        "triangularity",
+        "boundary_triangularity",
+        "boundary_peak_count",
+        "boundary_corner_score",
+        "boundary_straightness",
+        "triangle_shape_score",
         "collision_mean",
         "action_mean",
         "sinkhorn_entropy",
@@ -140,6 +141,20 @@ def summarize(values: torch.Tensor) -> Dict[str, float]:
     }
 
 
+def zero_done_hidden(
+    hx: torch.Tensor,
+    dones: torch.Tensor,
+    batch_size: int,
+    n_agents: int,
+) -> torch.Tensor:
+    if hx is None or not torch.any(dones):
+        return hx
+    hidden = hx.shape[-1]
+    hx_view = hx.view(batch_size, n_agents, hidden).clone()
+    hx_view[dones] = 0.0
+    return hx_view.view(batch_size * n_agents, hidden)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -152,12 +167,21 @@ def main() -> None:
     ckpt_args = ckpt.get("args", {})
     n_agents = int(ckpt_args.get("n_agents", 30))
     actor_hidden = int(ckpt_args.get("actor_hidden", 256))
+    recurrent = bool(ckpt_args.get("recurrent", False))
     # Prefer obs_dim stored in checkpoint args; otherwise infer from the first linear layer.
     obs_dim_expected = ckpt_args.get("obs_dim", None)
     if obs_dim_expected is None:
         w = ckpt.get("actor_state", {}).get("net.0.weight", None)
+        if w is None:
+            w = ckpt.get("actor_state", {}).get("fc_in.weight", None)
+        if w is None:
+            w = ckpt.get("actor_state", {}).get("node_encoder.0.weight", None)
         if isinstance(w, torch.Tensor) and w.ndim == 2:
-            obs_dim_expected = int(w.shape[1])
+            if "node_encoder.0.weight" in ckpt.get("actor_state", {}):
+                top_k = int(ckpt_args.get("obs_top_k_neighbors", 8))
+                obs_dim_expected = int(w.shape[1] + top_k * 4)
+            else:
+                obs_dim_expected = int(w.shape[1])
 
     # Keep evaluation horizon consistent with training unless explicitly overridden.
     if args.max_episode_steps is None:
@@ -175,10 +199,21 @@ def main() -> None:
         "pile_center_y_mm_range",
         "pile_halfwidth_mm",
         "obs_top_k_neighbors",
+        "obs_include_goal_rel",
+        "gnn_obs_self_only",
         "turn_v_frac",
         "normalize_obs",
         "formation_w",
         "spacing_w",
+        "boundary_spacing_scale",
+        "spacing_ratio_lo",
+        "spacing_ratio_hi",
+        "triangle_w",
+        "boundary_frac",
+        "corner_peak_ratio",
+        "triangle_shape_w_tri",
+        "triangle_shape_w_corner",
+        "triangle_shape_w_straight",
         "lattice_w",
         "lattice_k",
         "formation_sinkhorn_tau",
@@ -186,6 +221,7 @@ def main() -> None:
         "formation_eps",
         "formation_template_seed",
         "progress_reward",
+        "mixed_reward",
         "share_reward",
         "safe_collision_w",
         "safe_action_w",
@@ -241,6 +277,24 @@ def main() -> None:
         scenario_kwargs["formation_w"] = float(args.formation_w)
     if args.spacing_w is not None:
         scenario_kwargs["spacing_w"] = float(args.spacing_w)
+    if args.boundary_spacing_scale is not None:
+        scenario_kwargs["boundary_spacing_scale"] = float(args.boundary_spacing_scale)
+    if args.spacing_ratio_lo is not None:
+        scenario_kwargs["spacing_ratio_lo"] = float(args.spacing_ratio_lo)
+    if args.spacing_ratio_hi is not None:
+        scenario_kwargs["spacing_ratio_hi"] = float(args.spacing_ratio_hi)
+    if args.triangle_w is not None:
+        scenario_kwargs["triangle_w"] = float(args.triangle_w)
+    if args.boundary_frac is not None:
+        scenario_kwargs["boundary_frac"] = float(args.boundary_frac)
+    if args.corner_peak_ratio is not None:
+        scenario_kwargs["corner_peak_ratio"] = float(args.corner_peak_ratio)
+    if args.triangle_shape_w_tri is not None:
+        scenario_kwargs["triangle_shape_w_tri"] = float(args.triangle_shape_w_tri)
+    if args.triangle_shape_w_corner is not None:
+        scenario_kwargs["triangle_shape_w_corner"] = float(args.triangle_shape_w_corner)
+    if args.triangle_shape_w_straight is not None:
+        scenario_kwargs["triangle_shape_w_straight"] = float(args.triangle_shape_w_straight)
     if args.lattice_w is not None:
         scenario_kwargs["lattice_w"] = float(args.lattice_w)
     if args.lattice_k is not None:
@@ -307,7 +361,18 @@ def main() -> None:
         sys.stdout.flush()
 
     # Build the actor with the expected obs_dim (after optional scenario padding).
-    actor = Actor(obs_dim=int(obs_dim), hidden=actor_hidden).to(env.device)
+    actor = build_actor(
+        obs_dim=int(obs_dim),
+        hidden=actor_hidden,
+        recurrent=recurrent,
+        gnn=bool(ckpt_args.get("gnn", False)),
+        obs_top_k_neighbors=int(ckpt_args.get("obs_top_k_neighbors", 8)),
+        gnn_hidden=int(ckpt_args.get("gnn_hidden", 64)),
+        gnn_layers=int(ckpt_args.get("gnn_layers", 2)),
+        gnn_radius=float(ckpt_args.get("gnn_radius", float(getattr(env.scenario, "comm_r", 0.0)))),
+        gnn_top_k=int(ckpt_args.get("gnn_top_k", 0)),
+        gnn_residual_init=float(ckpt_args.get("gnn_residual_init", 0.1)),
+    ).to(env.device)
     actor.load_state_dict(ckpt["actor_state"])
     actor.eval()
 
@@ -323,6 +388,9 @@ def main() -> None:
         active = min(batch_envs, remaining)
 
         obs_list = env.reset()
+        hx = None
+        if recurrent:
+            hx = torch.zeros((batch_envs * n_agents, actor_hidden), device=env.device)
         ep_return = torch.zeros((batch_envs,), device=env.device)
 
         # Aggregate per-step metrics to avoid the "last frame only" pitfall and match training logs when needed.
@@ -332,18 +400,26 @@ def main() -> None:
         steps = 0
 
         for _t in range(args.max_episode_steps):
-            actions_for_env = []
             with torch.no_grad():
-                for i in range(n_agents):
-                    logits = actor(obs_list[i])
-                    if args.deterministic:
-                        a = torch.argmax(logits, dim=-1)
-                    else:
-                        dist = torch.distributions.Categorical(logits=logits)
-                        a = dist.sample()
-                    actions_for_env.append(a.unsqueeze(-1))
+                obs_all = torch.stack(obs_list, dim=1)
+                pos_all = None
+                rot_all = None
+                if actor.is_graph_actor:
+                    pos_all = torch.stack([a.state.pos for a in env.agents], dim=1)
+                    rot_all = torch.stack([a.state.rot for a in env.agents], dim=1)
+                logits_all, hx = actor(obs_all, hx, pos_all, rot_all)
+                logits_flat = logits_all.reshape(batch_envs * n_agents, -1)
+                if args.deterministic:
+                    a_flat = torch.argmax(logits_flat, dim=-1)
+                else:
+                    dist = torch.distributions.Categorical(logits=logits_flat)
+                    a_flat = dist.sample()
+                a = a_flat.view(batch_envs, n_agents)
+                actions_for_env = [a[:, i].unsqueeze(-1) for i in range(n_agents)]
 
             obs_list, rews, dones, infos = env.step(actions_for_env)
+            if recurrent:
+                hx = zero_done_hidden(hx, dones, batch_envs, n_agents)
             ep_return += rews[0]
             info0 = infos[0]
             steps += 1

@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
+from models.actor import build_actor
 from vmas import make_env
 from scenarios.triangle_fill import Scenario
 
@@ -50,6 +51,35 @@ def parse_args() -> argparse.Namespace:
     # Model size (saved in checkpoints for reproducibility)
     p.add_argument("--actor-hidden", type=int, default=256)
     p.add_argument("--critic-hidden", type=int, default=512)
+    p.add_argument("--recurrent", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--gnn", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--gnn-hidden", type=int, default=64)
+    p.add_argument("--gnn-layers", type=int, default=2)
+    p.add_argument(
+        "--gnn-residual-init",
+        type=float,
+        default=0.1,
+        help="Initial residual mixing coefficient for the GNN correction branch.",
+    )
+    p.add_argument(
+        "--gnn-top-k",
+        type=int,
+        default=0,
+        help="If >0, keep only the nearest K graph neighbors per agent (after optional radius filtering).",
+    )
+    p.add_argument(
+        "--gnn-radius",
+        type=float,
+        default=0.0,
+        help="Graph connection radius in simulation units. <=0 uses scenario.comm_r.",
+    )
+    p.add_argument(
+        "--gnn-obs-self-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Strip neighbor features from obs; GNN handles all inter-agent communication.",
+    )
+    p.add_argument("--chunk-len", type=int, default=16, help="Recurrent PPO sequence chunk length.")
 
     # PPO hyperparams
     p.add_argument("--lr-actor", type=float, default=3e-4)
@@ -114,13 +144,82 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--formation-template-seed", type=int, default=0)
     p.add_argument("--target-spacing-mm", type=float, default=45.0, help="Target nearest-neighbor distance in mm.")
     p.add_argument("--spacing-w", type=float, default=1.0)
+    p.add_argument(
+        "--boundary-spacing-scale",
+        type=float,
+        default=1.0,
+        help="Multiplier for spacing loss on boundary agents only. 1.0 keeps legacy behavior.",
+    )
+    p.add_argument(
+        "--spacing-ratio-lo",
+        type=float,
+        default=1.0,
+        help="Lower bound of flat-bottom spacing band, expressed as a ratio of target spacing.",
+    )
+    p.add_argument(
+        "--spacing-ratio-hi",
+        type=float,
+        default=1.0,
+        help="Upper bound of flat-bottom spacing band, expressed as a ratio of target spacing.",
+    )
+    p.add_argument(
+        "--triangle-w",
+        type=float,
+        default=0.0,
+        help="Optional direct triangularity reward weight. Default 0.0 keeps it metric-only.",
+    )
+    p.add_argument(
+        "--boundary-frac",
+        type=float,
+        default=0.35,
+        help="Fraction of farthest-from-centroid agents treated as boundary points for shape metrics.",
+    )
+    p.add_argument(
+        "--corner-peak-ratio",
+        type=float,
+        default=1.15,
+        help="Peak threshold for the boundary radial-profile corner metric, relative to mean boundary radius.",
+    )
+    p.add_argument(
+        "--triangle-shape-w-tri",
+        type=float,
+        default=0.45,
+        help="Weight of boundary triangularity inside triangle_shape_score.",
+    )
+    p.add_argument(
+        "--triangle-shape-w-corner",
+        type=float,
+        default=0.30,
+        help="Weight of boundary corner score inside triangle_shape_score.",
+    )
+    p.add_argument(
+        "--triangle-shape-w-straight",
+        type=float,
+        default=0.25,
+        help="Weight of boundary straightness inside triangle_shape_score.",
+    )
     p.add_argument("--lattice-w", type=float, default=0.0)
+    p.add_argument(
+        "--reward-schedule-update",
+        type=int,
+        default=0,
+        help="If >0, switch reward weights at this global update.",
+    )
+    p.add_argument("--formation-w-late", type=float, default=None)
+    p.add_argument("--spacing-w-late", type=float, default=None)
+    p.add_argument("--lattice-w-late", type=float, default=None)
     p.add_argument("--lattice-k", type=int, default=6)
     p.add_argument(
         "--per-agent-reward",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use per-agent reward decomposition instead of a shared global reward.",
+    )
+    p.add_argument(
+        "--mixed-reward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use global shape reward with per-agent local spacing/lattice/collision terms.",
     )
     p.add_argument("--progress-reward", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
@@ -169,6 +268,11 @@ def parse_args() -> argparse.Namespace:
     # Resume
     p.add_argument("--resume", default=None, help="Path to checkpoint .pt to resume from")
     p.add_argument(
+        "--actor-init-ckpt",
+        default=None,
+        help="Optional checkpoint path used to warm-start matching actor submodules (e.g. fc_in/gru_cell/fc_out). Ignored when --resume is set.",
+    )
+    p.add_argument(
         "--resume-rng",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -194,21 +298,6 @@ def parse_args() -> argparse.Namespace:
         p.set_defaults(**config_defaults)
 
     return p.parse_args()
-
-
-class Actor(nn.Module):
-    def __init__(self, obs_dim: int, hidden: int, n_actions: int = 4):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, n_actions),
-        )
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
 
 
 class Critic(nn.Module):
@@ -308,6 +397,12 @@ def metric_keys_for_training() -> List[str]:
         "local_lattice_progress_mean",
         "global_shape_progress_mean",
         "formation_score",
+        "triangularity",
+        "boundary_triangularity",
+        "boundary_peak_count",
+        "boundary_corner_score",
+        "boundary_straightness",
+        "triangle_shape_score",
         "collision_mean",
         "action_mean",
         "sinkhorn_entropy",
@@ -355,6 +450,8 @@ def _checkpoint_payload(
     critic_opt: optim.Optimizer,
     args: argparse.Namespace,
     update: int,
+    best_formation_score: float | None = None,
+    best_formation_loss: float | None = None,
     scaler_actor = None,
     scaler_critic = None,
 ) -> dict:
@@ -367,6 +464,10 @@ def _checkpoint_payload(
         "critic_opt_state": critic_opt.state_dict(),
         "torch_rng_state": torch.get_rng_state(),
     }
+    if best_formation_score is not None:
+        payload["best_formation_score"] = float(best_formation_score)
+    if best_formation_loss is not None:
+        payload["best_formation_loss"] = float(best_formation_loss)
     if args.device == "cuda" and torch.cuda.is_available():
         payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
     # ⭐ AMP: Save scaler states for resume
@@ -395,7 +496,14 @@ def _infer_obs_dim_expected(ckpt: dict) -> int | None:
         except Exception:
             pass
     w = ckpt.get("actor_state", {}).get("net.0.weight", None)
+    if w is None:
+        w = ckpt.get("actor_state", {}).get("fc_in.weight", None)
+    if w is None:
+        w = ckpt.get("actor_state", {}).get("node_encoder.0.weight", None)
     if isinstance(w, torch.Tensor) and w.ndim == 2:
+        if "node_encoder.0.weight" in ckpt.get("actor_state", {}):
+            top_k = int(ckpt_args.get("obs_top_k_neighbors", 8))
+            return int(w.shape[1] + top_k * 4)
         return int(w.shape[1])
     return None
 
@@ -429,6 +537,20 @@ def _ent_coef_at_update(args: argparse.Namespace, update: int) -> float:
     return float(args.ent_coef) + t * (float(args.ent_coef_end) - float(args.ent_coef))
 
 
+def zero_done_hidden(
+    hx: torch.Tensor,
+    dones: torch.Tensor,
+    batch_size: int,
+    n_agents: int,
+) -> torch.Tensor:
+    if hx is None or not torch.any(dones):
+        return hx
+    hidden = hx.shape[-1]
+    hx_view = hx.view(batch_size, n_agents, hidden).clone()
+    hx_view[dones] = 0.0
+    return hx_view.view(batch_size * n_agents, hidden)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -449,6 +571,12 @@ def main() -> None:
             torch.use_deterministic_algorithms(True)
         except Exception:
             pass
+    if args.gnn_obs_self_only and not args.gnn:
+        print("WARNING: --gnn-obs-self-only has no effect without --gnn")
+    if args.mixed_reward and not args.per_agent_reward:
+        raise ValueError("--mixed-reward requires --per-agent-reward so local terms can stay agent-specific")
+    if args.mixed_reward and args.progress_reward:
+        raise ValueError("--mixed-reward currently requires --no-progress-reward")
 
     scenario = Scenario()
     # Build scenario kwargs (only pass explicitly-set values, otherwise scenario defaults apply).
@@ -461,6 +589,15 @@ def main() -> None:
         "formation_template_seed": int(args.formation_template_seed),
         "target_spacing_mm": float(args.target_spacing_mm),
         "spacing_w": float(args.spacing_w),
+        "boundary_spacing_scale": float(args.boundary_spacing_scale),
+        "spacing_ratio_lo": float(args.spacing_ratio_lo),
+        "spacing_ratio_hi": float(args.spacing_ratio_hi),
+        "triangle_w": float(args.triangle_w),
+        "boundary_frac": float(args.boundary_frac),
+        "corner_peak_ratio": float(args.corner_peak_ratio),
+        "triangle_shape_w_tri": float(args.triangle_shape_w_tri),
+        "triangle_shape_w_corner": float(args.triangle_shape_w_corner),
+        "triangle_shape_w_straight": float(args.triangle_shape_w_straight),
         "lattice_w": float(args.lattice_w),
         "lattice_k": int(args.lattice_k),
         "share_reward": not bool(args.per_agent_reward),
@@ -491,6 +628,10 @@ def main() -> None:
         scenario_kwargs["obs_top_k_neighbors"] = int(args.obs_top_k_neighbors)
     if args.obs_include_goal_rel is not None:
         scenario_kwargs["obs_include_goal_rel"] = bool(args.obs_include_goal_rel)
+    if args.gnn_obs_self_only:
+        scenario_kwargs["gnn_obs_self_only"] = True
+    if args.mixed_reward:
+        scenario_kwargs["mixed_reward"] = True
 
     # If resuming, infer the expected obs_dim and ask the scenario to pad observations to match.
     # This avoids state_dict load failures when the scenario observation vector has evolved.
@@ -523,13 +664,37 @@ def main() -> None:
     obs_dim = obs_list[0].shape[-1]
     try:
         setattr(args, "obs_dim", int(obs_dim))
-        setattr(args, "obs_mode", "local_bodyframe_topk_v1")
-        setattr(args, "obs_top_k_neighbors", int(args.obs_top_k_neighbors) if args.obs_top_k_neighbors is not None else 8)
+        setattr(
+            args,
+            "obs_mode",
+            "gnn_self_only_v1" if bool(args.gnn_obs_self_only) else "local_bodyframe_topk_v1",
+        )
+        setattr(
+            args,
+            "obs_top_k_neighbors",
+            int(args.obs_top_k_neighbors)
+            if args.obs_top_k_neighbors is not None
+            else int(getattr(scenario, "obs_top_k_neighbors", 8)),
+        )
+        setattr(args, "gnn_obs_self_only", bool(args.gnn_obs_self_only))
     except Exception:
         pass
     metric_keys = metric_keys_for_training()
 
-    actor_model = Actor(obs_dim=obs_dim, hidden=args.actor_hidden).to(env.device)
+    gnn_radius = float(args.gnn_radius) if float(args.gnn_radius) > 0.0 else float(getattr(scenario, "comm_r", 0.0))
+    setattr(args, "gnn_radius", gnn_radius)
+    actor_model = build_actor(
+        obs_dim=obs_dim,
+        hidden=args.actor_hidden,
+        recurrent=bool(args.recurrent),
+        gnn=bool(args.gnn),
+        obs_top_k_neighbors=int(args.obs_top_k_neighbors),
+        gnn_hidden=int(args.gnn_hidden),
+        gnn_layers=int(args.gnn_layers),
+        gnn_radius=gnn_radius,
+        gnn_top_k=int(args.gnn_top_k),
+        gnn_residual_init=float(args.gnn_residual_init),
+    ).to(env.device)
     critic_model = Critic(per_agent_dim=5, hidden=args.critic_hidden).to(env.device)
     actor_opt = optim.Adam(actor_model.parameters(), lr=args.lr_actor)
     critic_opt = optim.Adam(critic_model.parameters(), lr=args.lr_critic)
@@ -558,6 +723,24 @@ def main() -> None:
         print(f"TensorBoard logging enabled. Run: tensorboard --logdir={out_dir / 'tensorboard'}")
 
     start_update = 1
+    best_formation_score = float("-inf")
+    best_formation_loss = float("inf")
+    if args.actor_init_ckpt and not args.resume:
+        init_ckpt_path = Path(args.actor_init_ckpt)
+        init_ckpt = load_checkpoint(init_ckpt_path, device=env.device)
+        init_state = init_ckpt.get("actor_state", {})
+        model_state = actor_model.state_dict()
+        transferable = {
+            k: v
+            for k, v in init_state.items()
+            if k in model_state and model_state[k].shape == v.shape
+        }
+        missing, unexpected = actor_model.load_state_dict(transferable, strict=False)
+        print(
+            f"Warm-started actor from {init_ckpt_path} "
+            f"with {len(transferable)} matching tensors; "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
     if args.resume:
         ckpt_path = Path(args.resume)
         ckpt = load_checkpoint(ckpt_path, device=env.device)
@@ -602,6 +785,8 @@ def main() -> None:
                     print(f"WARNING: failed to restore CUDA RNG state: {e}")
 
         start_update = int(ckpt.get("update", 0)) + 1
+        best_formation_score = float(ckpt.get("best_formation_score", best_formation_score))
+        best_formation_loss = float(ckpt.get("best_formation_loss", best_formation_loss))
         print(f"Resumed from {ckpt_path} at update={start_update-1}. Continuing training.")
 
         # Guardrail: if you resume from a checkpoint that is already beyond --total-updates,
@@ -619,12 +804,32 @@ def main() -> None:
             encoding="utf-8",
         )
 
+    def _apply_reward_schedule(update_now: int) -> None:
+        formation_w_now = float(args.formation_w)
+        spacing_w_now = float(args.spacing_w)
+        lattice_w_now = float(args.lattice_w)
+        if int(args.reward_schedule_update) > 0 and update_now >= int(args.reward_schedule_update):
+            if args.formation_w_late is not None:
+                formation_w_now = float(args.formation_w_late)
+            if args.spacing_w_late is not None:
+                spacing_w_now = float(args.spacing_w_late)
+            if args.lattice_w_late is not None:
+                lattice_w_now = float(args.lattice_w_late)
+        scenario.formation_w = formation_w_now
+        scenario.spacing_w = spacing_w_now
+        scenario.lattice_w = lattice_w_now
+
     # Always write the current run config.
     (out_dir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
 
     T = args.rollout_steps
     B = env.batch_dim
-    actor = maybe_compile_module(actor_model, bool(args.torch_compile), "actor")
+    if args.recurrent and T % args.chunk_len != 0:
+        raise ValueError(f"--rollout-steps ({T}) must be divisible by --chunk-len ({args.chunk_len}) when --recurrent is enabled")
+    actor_compile_enabled = bool(args.torch_compile) and not bool(args.recurrent)
+    if args.recurrent and args.torch_compile:
+        print("WARNING: recurrent actor requested; skipping torch.compile() for actor and keeping eager GRUCell execution.")
+    actor = maybe_compile_module(actor_model, actor_compile_enabled, "actor")
     critic = maybe_compile_module(critic_model, bool(args.torch_compile), "critic")
 
     obs_buf = torch.empty((T, B, n_agents, obs_dim), device=env.device)
@@ -636,8 +841,21 @@ def main() -> None:
     trunc_val_buf = torch.empty((T, B), device=env.device)
     feat_buf = torch.empty((T, B, n_agents, 5), device=env.device)
     lrms_buf = torch.empty((T, B), device=env.device)
+    pos_buf = None
+    rot_buf = None
+    if actor_model.is_graph_actor:
+        pos_buf = torch.empty((T, B, n_agents, 2), device=env.device)
+        rot_buf = torch.empty((T, B, n_agents, 1), device=env.device)
+    hx_store = None
+    hx = None
+    if args.recurrent:
+        n_chunks_t = T // args.chunk_len
+        hidden_dtype = next(actor_model.parameters()).dtype
+        hx_store = torch.empty((n_chunks_t, B, n_agents, args.actor_hidden), device=env.device, dtype=hidden_dtype)
+        hx = torch.zeros((B * n_agents, args.actor_hidden), device=env.device, dtype=hidden_dtype)
 
     for update in range(start_update, args.total_updates + 1):
+        _apply_reward_schedule(update)
         # Rolling averages of env-provided diagnostics (Scenario.info()).
         # Keep defaults for missing keys so logging never crashes mid-training.
         metric_acc = {k: torch.zeros((), device=env.device) for k in metric_keys}
@@ -652,13 +870,20 @@ def main() -> None:
                 lrms_buf[t] = lrms_t
                 val_buf[t] = critic(feat_t, lrms_t)
 
-                # ⭐ BATCHED ACTOR FORWARD (2-10x speedup!)
-                # Stack all agent observations and forward in one pass instead of N separate calls.
                 obs_all = torch.stack(obs_list, dim=1)  # [B, N, obs_dim]
-                obs_all_flat = obs_all.reshape(B * n_agents, obs_dim)  # [B*N, obs_dim]
+                pos_all = None
+                rot_all = None
+                if actor_model.is_graph_actor:
+                    pos_all = torch.stack([a.state.pos for a in env.agents], dim=1)  # [B, N, 2]
+                    rot_all = torch.stack([a.state.rot for a in env.agents], dim=1)  # [B, N, 1]
 
-                logits_all = actor(obs_all_flat)  # [B*N, n_actions] - single batched forward!
-                dist = torch.distributions.Categorical(logits=logits_all)
+                if args.recurrent:
+                    if t % args.chunk_len == 0:
+                        hx_store[t // args.chunk_len] = hx.detach().view(B, n_agents, args.actor_hidden)
+                    logits_all, hx = actor(obs_all, hx, pos_all, rot_all)
+                else:
+                    logits_all, _ = actor(obs_all, None, pos_all, rot_all)
+                dist = torch.distributions.Categorical(logits=logits_all.reshape(B * n_agents, -1))
                 a_flat = dist.sample()  # [B*N]
                 logp_flat = dist.log_prob(a_flat)  # [B*N]
 
@@ -668,6 +893,9 @@ def main() -> None:
 
                 # Store in buffers
                 obs_buf[t] = obs_all  # [B, N, obs_dim]
+                if actor_model.is_graph_actor:
+                    pos_buf[t] = pos_all
+                    rot_buf[t] = rot_all
                 act_buf[t] = a  # [B, N]
                 logp_buf[t] = logp  # [B, N]
 
@@ -683,6 +911,8 @@ def main() -> None:
                 with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
                     trunc_feat, trunc_lrms = build_critic_input(env.agents, scenario.v0)
                     trunc_val_buf[t] = critic(trunc_feat, trunc_lrms) * dones.float()
+                if args.recurrent:
+                    hx = zero_done_hidden(hx, dones, B, n_agents)
 
             accumulate_metrics(metric_acc, infos, metric_keys)
             metric_steps += 1
@@ -710,12 +940,6 @@ def main() -> None:
             )
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # Flatten policy batch: (T,B,N)
-        obs_flat = obs_buf.reshape(T * B * n_agents, obs_dim)
-        act_flat = act_buf.reshape(T * B * n_agents)
-        old_logp_flat = logp_buf.reshape(T * B * n_agents)
-        adv_flat = adv.reshape(T * B * n_agents)
-
         # Flatten value batch: (T,B)
         global_feat_flat = feat_buf.reshape(T * B, n_agents, 5)
         global_lrms_flat = lrms_buf.reshape(T * B)
@@ -723,9 +947,15 @@ def main() -> None:
         ret_flat = ret_for_critic.reshape(T * B)
         old_val_flat = val_buf.reshape(T * B)
 
-        batch_policy = obs_flat.shape[0]
+        obs_graph_flat = obs_buf.reshape(T * B, n_agents, obs_dim)
+        pos_graph_flat = pos_buf.reshape(T * B, n_agents, 2) if pos_buf is not None else None
+        rot_graph_flat = rot_buf.reshape(T * B, n_agents, 1) if rot_buf is not None else None
+        act_graph_flat = act_buf.reshape(T * B, n_agents)
+        old_logp_graph_flat = logp_buf.reshape(T * B, n_agents)
+        adv_graph_flat = adv.reshape(T * B, n_agents)
+        batch_policy_graphs = T * B
         batch_value = global_feat_flat.shape[0]
-        mb_policy = min(args.minibatch_size_policy, batch_policy)
+        mb_policy = min(args.minibatch_size_policy, batch_policy_graphs * n_agents)
         mb_value = min(args.minibatch_size_value, batch_value)
 
         # Accumulate losses and gradient norms for logging
@@ -741,42 +971,119 @@ def main() -> None:
             ent_coef_now = _ent_coef_at_update(args, update)
 
             # Actor update
-            perm_p = torch.randperm(batch_policy, device=env.device)
-            for start_i in range(0, batch_policy, mb_policy):
-                mb = perm_p[start_i : start_i + mb_policy]
+            if not args.recurrent:
+                graphs_per_mb = max(1, mb_policy // n_agents)
+                perm_p = torch.randperm(batch_policy_graphs, device=env.device)
+                for start_i in range(0, batch_policy_graphs, graphs_per_mb):
+                    mb = perm_p[start_i : start_i + graphs_per_mb]
 
-                # ⭐ AMP: Use autocast for forward pass and loss computation
-                with torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
-                    logits = actor(obs_flat[mb])
-                    dist = torch.distributions.Categorical(logits=logits)
-                    new_logp = dist.log_prob(act_flat[mb])
-                    entropy = dist.entropy().mean()
+                    with torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
+                        logits, _ = actor(
+                            obs_graph_flat[mb],
+                            None,
+                            None if pos_graph_flat is None else pos_graph_flat[mb],
+                            None if rot_graph_flat is None else rot_graph_flat[mb],
+                        )
+                        logits_flat = logits.reshape(-1, logits.shape[-1])
+                        act_flat_mb = act_graph_flat[mb].reshape(-1)
+                        old_logp_flat_mb = old_logp_graph_flat[mb].reshape(-1)
+                        adv_flat_mb = adv_graph_flat[mb].reshape(-1)
+                        dist = torch.distributions.Categorical(logits=logits_flat)
+                        new_logp = dist.log_prob(act_flat_mb)
+                        entropy = dist.entropy().mean()
 
-                    ratio = (new_logp - old_logp_flat[mb]).exp()
-                    pg1 = -adv_flat[mb] * ratio
-                    pg2 = -adv_flat[mb] * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
-                    policy_loss = torch.max(pg1, pg2).mean()
+                        ratio = (new_logp - old_logp_flat_mb).exp()
+                        pg1 = -adv_flat_mb * ratio
+                        pg2 = -adv_flat_mb * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+                        policy_loss = torch.max(pg1, pg2).mean()
 
-                    actor_loss = policy_loss - ent_coef_now * entropy
+                        actor_loss = policy_loss - ent_coef_now * entropy
 
-                actor_opt.zero_grad(set_to_none=True)
-                # ⭐ AMP: Use scaler for backward pass
-                scaler_actor.scale(actor_loss).backward()
-                scaler_actor.unscale_(actor_opt)
-                # Compute gradient norm before clipping
-                actor_grad_norm = nn.utils.clip_grad_norm_(actor_model.parameters(), args.max_grad_norm)
-                scaler_actor.step(actor_opt)
-                scaler_actor.update()
+                    actor_opt.zero_grad(set_to_none=True)
+                    scaler_actor.scale(actor_loss).backward()
+                    scaler_actor.unscale_(actor_opt)
+                    actor_grad_norm = nn.utils.clip_grad_norm_(actor_model.parameters(), args.max_grad_norm)
+                    scaler_actor.step(actor_opt)
+                    scaler_actor.update()
 
-                # Accumulate for logging
-                acc_policy_loss += policy_loss.detach()
-                acc_entropy += entropy.detach()
-                acc_actor_grad_norm += (
-                    actor_grad_norm.detach()
-                    if isinstance(actor_grad_norm, torch.Tensor)
-                    else torch.tensor(actor_grad_norm, device=env.device)
-                )
-                n_actor_steps += 1
+                    acc_policy_loss += policy_loss.detach()
+                    acc_entropy += entropy.detach()
+                    acc_actor_grad_norm += (
+                        actor_grad_norm.detach()
+                        if isinstance(actor_grad_norm, torch.Tensor)
+                        else torch.tensor(actor_grad_norm, device=env.device)
+                    )
+                    n_actor_steps += 1
+            else:
+                L = args.chunk_len
+                n_chunks_t = T // L
+                total_chunks = n_chunks_t * B
+                chunks_per_mb = max(1, args.minibatch_size_policy // (L * n_agents))
+                chunk_perm = torch.randperm(total_chunks, device=env.device)
+
+                for start_c in range(0, total_chunks, chunks_per_mb):
+                    mb_ids = chunk_perm[start_c : start_c + chunks_per_mb]
+                    ct = mb_ids // B
+                    cb = mb_ids % B
+                    n_mb = int(mb_ids.numel())
+                    if n_mb == 0:
+                        continue
+
+                    t_offsets = torch.arange(L, device=env.device).unsqueeze(1) + (ct * L).unsqueeze(0)
+                    cb_exp = cb.unsqueeze(0).expand(L, -1)
+
+                    obs_chunks = obs_buf[t_offsets, cb_exp]
+                    pos_chunks = pos_buf[t_offsets, cb_exp] if pos_buf is not None else None
+                    rot_chunks = rot_buf[t_offsets, cb_exp] if rot_buf is not None else None
+                    act_chunks = act_buf[t_offsets, cb_exp]
+                    logp_chunks = logp_buf[t_offsets, cb_exp]
+                    adv_chunks = adv[t_offsets, cb_exp]
+                    done_chunks = done_buf[t_offsets, cb_exp]
+
+                    hx_init = hx_store[ct, cb].reshape(n_mb * n_agents, args.actor_hidden).detach()
+
+                    with torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
+                        hx_run = hx_init
+                        all_logits = []
+                        for l in range(L):
+                            obs_l = obs_chunks[l]
+                            pos_l = None if pos_chunks is None else pos_chunks[l]
+                            rot_l = None if rot_chunks is None else rot_chunks[l]
+                            logits_l, hx_run = actor(obs_l, hx_run, pos_l, rot_l)
+                            all_logits.append(logits_l)
+                            if done_chunks[l].any():
+                                hx_run = zero_done_hidden(hx_run, done_chunks[l], n_mb, n_agents)
+
+                        logits_seq = torch.stack(all_logits, dim=0)
+                        logits_flat = logits_seq.reshape(L * n_mb * n_agents, -1)
+                        act_flat_mb = act_chunks.reshape(L * n_mb * n_agents)
+                        old_logp_flat_mb = logp_chunks.reshape(L * n_mb * n_agents)
+                        adv_flat_mb = adv_chunks.reshape(L * n_mb * n_agents)
+
+                        dist = torch.distributions.Categorical(logits=logits_flat)
+                        new_logp = dist.log_prob(act_flat_mb)
+                        entropy = dist.entropy().mean()
+                        ratio = (new_logp - old_logp_flat_mb).exp()
+                        pg1 = -adv_flat_mb * ratio
+                        pg2 = -adv_flat_mb * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+                        policy_loss = torch.max(pg1, pg2).mean()
+                        actor_loss = policy_loss - ent_coef_now * entropy
+
+                    actor_opt.zero_grad(set_to_none=True)
+                    scaler_actor.scale(actor_loss).backward()
+                    scaler_actor.unscale_(actor_opt)
+                    actor_grad_norm = nn.utils.clip_grad_norm_(actor_model.parameters(), args.max_grad_norm)
+                    scaler_actor.step(actor_opt)
+                    scaler_actor.update()
+
+                    acc_policy_loss += policy_loss.detach()
+                    acc_entropy += entropy.detach()
+                    acc_actor_grad_norm += (
+                        actor_grad_norm.detach()
+                        if isinstance(actor_grad_norm, torch.Tensor)
+                        else torch.tensor(actor_grad_norm, device=env.device)
+                    )
+                    n_actor_steps += 1
 
             # Critic update
             perm_v = torch.randperm(batch_value, device=env.device)
@@ -870,11 +1177,70 @@ def main() -> None:
                 writer.add_scalar("train/steps_per_second", T * B / max(total_time, 1e-6), update)
                 writer.add_scalar("train/env_steps_per_second", T * B / max(rollout_time, 1e-6), update)
 
+            cur_score = float(metric_mean.get("formation_score", float("-inf")))
+            cur_loss = float(metric_mean.get("formation_loss", float("inf")))
+
+            if cur_score > best_formation_score:
+                best_formation_score = cur_score
+                payload = _checkpoint_payload(
+                    actor_model,
+                    critic_model,
+                    actor_opt,
+                    critic_opt,
+                    args,
+                    update,
+                    best_formation_score=best_formation_score,
+                    best_formation_loss=best_formation_loss,
+                    scaler_actor=scaler_actor,
+                    scaler_critic=scaler_critic,
+                )
+                save_checkpoint(out_dir / "ckpt_best_score.pt", payload)
+                print(f"saved best score checkpoint at update={update} formation_score={best_formation_score:.3f}")
+
+            if cur_loss < best_formation_loss:
+                best_formation_loss = cur_loss
+                payload = _checkpoint_payload(
+                    actor_model,
+                    critic_model,
+                    actor_opt,
+                    critic_opt,
+                    args,
+                    update,
+                    best_formation_score=best_formation_score,
+                    best_formation_loss=best_formation_loss,
+                    scaler_actor=scaler_actor,
+                    scaler_critic=scaler_critic,
+                )
+                save_checkpoint(out_dir / "ckpt_best_loss.pt", payload)
+                print(f"saved best loss checkpoint at update={update} formation_loss={best_formation_loss:.3f}")
+
         if args.save_every > 0 and update % args.save_every == 0:
-            payload = _checkpoint_payload(actor_model, critic_model, actor_opt, critic_opt, args, update, scaler_actor, scaler_critic)
+            payload = _checkpoint_payload(
+                actor_model,
+                critic_model,
+                actor_opt,
+                critic_opt,
+                args,
+                update,
+                best_formation_score=best_formation_score,
+                best_formation_loss=best_formation_loss,
+                scaler_actor=scaler_actor,
+                scaler_critic=scaler_critic,
+            )
             save_checkpoint(out_dir / f"ckpt_{update:06d}.pt", payload)
 
-    payload = _checkpoint_payload(actor_model, critic_model, actor_opt, critic_opt, args, args.total_updates, scaler_actor, scaler_critic)
+    payload = _checkpoint_payload(
+        actor_model,
+        critic_model,
+        actor_opt,
+        critic_opt,
+        args,
+        args.total_updates,
+        best_formation_score=best_formation_score,
+        best_formation_loss=best_formation_loss,
+        scaler_actor=scaler_actor,
+        scaler_critic=scaler_critic,
+    )
     save_checkpoint(out_dir / "ckpt_final.pt", payload)
 
     if writer is not None:
