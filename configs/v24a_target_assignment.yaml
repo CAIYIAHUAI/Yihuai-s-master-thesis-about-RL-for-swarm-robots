@@ -1,0 +1,97 @@
+# v24a: Per-agent target assignment via Hungarian matching
+#
+# Core change: each agent gets a frozen target point at episode reset.
+# Target is computed by Hungarian matching agents to the best-oriented
+# (12 candidates: 6 rotations × 2 mirrors) scaled template anchored at
+# formation_center. Reward includes potential-based shaping toward target.
+# Obs goal_rel now points to agent's own target instead of formation_center.
+#
+# Existing formation/spacing/lattice/triangle rewards are kept but demoted
+# to auxiliary — target progress is the primary per-agent gradient signal.
+
+device: cuda
+num-envs: 128
+n-agents: 30
+max-episode-steps: 1000
+
+rollout-steps: 256
+total-updates: 800
+
+actor-hidden: 256
+critic-hidden: 512
+recurrent: true
+chunk-len: 16
+gnn: true
+gnn-hidden: 64
+gnn-layers: 2
+gnn-residual-init: 0.5
+gnn-radius: 0.085
+gnn-top-k: 8
+gnn-obs-self-only: true
+
+lr-actor: 3.0e-4
+lr-critic: 3.0e-4
+gamma: 0.99
+gae-lambda: 0.95
+clip-coef: 0.2
+ent-coef: 0.02
+ent-coef-end: 0.005
+ent-decay-updates: 600
+vf-coef: 1.0
+max-grad-norm: 0.5
+update-epochs: 4
+minibatch-size-policy: 2048
+minibatch-size-value: 2048
+value-clip: 0.2
+amp: false
+amp-dtype: bf16
+torch-compile: false
+lr-end-factor: 0.1
+
+# === Per-agent target assignment (NEW) ===
+target-progress-w: 50.0
+target-success-radius-mm: 33.0
+target-success-bonus: 0.0
+
+# === Existing rewards demoted to auxiliary ===
+formation-w: 0.5
+formation-sinkhorn-tau: 0.001
+formation-sinkhorn-iters: 30
+formation-eps: 1.0e-8
+formation-template-seed: 0
+target-spacing-mm: 45.0
+spacing-w: 0.3
+boundary-spacing-scale: 0.3
+spacing-ratio-lo: 0.85
+spacing-ratio-hi: 1.15
+triangle-w: 0.1
+boundary-frac: 0.35
+corner-peak-ratio: 1.15
+triangle-shape-w-tri: 0.45
+triangle-shape-w-corner: 0.30
+triangle-shape-w-straight: 0.25
+lattice-w: 0.1
+reward-schedule-update: 0
+formation-w-late: 1.5
+spacing-w-late: 0.5
+lattice-w-late: 0.5
+lattice-k: 6
+per-agent-reward: true
+mixed-reward: true
+progress-reward: false
+success-bonus: 0.0
+success-threshold: 0.05
+safe-collision-w: 0.5
+safe-action-w: 0.0
+
+normalize-obs: true
+obs-top-k-neighbors: 8
+obs-include-goal-rel: true
+fast-collisions: false
+
+seed: 0
+deterministic: false
+log-every: 5
+save-every: 50
+out-dir: runs/triangle_fill_v24a_target_assignment
+tensorboard: true

@@ -137,6 +137,11 @@ class Scenario(BaseScenario):
         self.torch_compile = bool(kwargs.pop("torch_compile", False))
         self.fast_collisions = bool(kwargs.pop("fast_collisions", False))
 
+        # Per-agent target assignment (potential-based shaping toward assigned template positions).
+        self.target_progress_w = float(kwargs.pop("target_progress_w", 0.0))
+        self.target_success_radius_mm = float(kwargs.pop("target_success_radius_mm", 33.0))
+        self.target_success_bonus = float(kwargs.pop("target_success_bonus", 0.0))
+
         # Spawn (pile) config for formation training.
         # We keep the default spawn below origin to avoid immediate dense collisions.
         self.pile_center_mm = kwargs.pop("pile_center_mm", (0.0, -225.0))
@@ -229,6 +234,7 @@ class Scenario(BaseScenario):
             seed=self.formation_template_seed,
             side_length=1.0,
         ).to(device=device, dtype=torch.float32)
+        self._formation_template_points = tmpl.clone()  # [N, 2] raw template for target assignment
         self._formation_template_dist2 = squared_distance_matrix_batched(tmpl.unsqueeze(0))[0]  # [N,N]
         self._formation_soft_perm = make_formation_soft_permutation_fn(
             tau=self.formation_sinkhorn_tau,
@@ -255,7 +261,78 @@ class Scenario(BaseScenario):
         self._prev_per_agent_spacing_loss = None
         self._prev_per_agent_lattice_loss = None
 
+        # Per-agent target assignment state (lazily initialized on first reset)
+        self._target_per_agent = None   # [B, N, 2]
+        self._prev_target_dist = None   # [B, N]
+        self.target_success_radius = self.target_success_radius_mm * self.mm_to_unit
+
         return world
+
+    def _assign_targets_for_env(self, env_index: int) -> None:
+        """Compute per-agent targets for one env via Hungarian on best-oriented template."""
+        if self._target_per_agent is None:
+            B = self.world.batch_dim
+            self._target_per_agent = torch.zeros(
+                (B, self.n_agents, 2), device=self.world.device, dtype=torch.float32
+            )
+            self._prev_target_dist = torch.full(
+                (B, self.n_agents), -1.0, device=self.world.device, dtype=torch.float32
+            )
+
+        pos = torch.stack(
+            [a.state.pos[env_index] for a in self.world.agents], dim=0
+        )  # [N, 2]
+
+        # Scale template so NN distance ≈ target_spacing
+        tmpl = self._formation_template_points.clone()  # [N, 2], centroid ≈ origin
+        tmpl_dist = torch.cdist(tmpl.unsqueeze(0), tmpl.unsqueeze(0))[0]
+        tmpl_dist.fill_diagonal_(float("inf"))
+        tmpl_nn = tmpl_dist.min(dim=-1).values.mean()
+        scale = self.target_spacing / max(float(tmpl_nn), 1e-8)
+        tmpl_scaled = tmpl * scale  # [N, 2], still centroid ≈ origin
+
+        # Anchor at formation_center (NOT swarm centroid)
+        anchor = self.formation_center  # [2]
+
+        # Try 12 candidate orientations (6 rotations × 2 mirrors) and pick best
+        from scipy.optimize import linear_sum_assignment
+        import numpy as np
+        best_cost = float("inf")
+        best_targets = None
+        best_col_idx = None
+
+        for do_mirror in [False, True]:
+            for k in range(6):
+                angle = k * math.pi / 3.0  # 0, 60, 120, 180, 240, 300 degrees
+                cos_a = math.cos(angle)
+                sin_a = math.sin(angle)
+                rot_mat = torch.tensor(
+                    [[cos_a, -sin_a], [sin_a, cos_a]],
+                    device=tmpl_scaled.device, dtype=tmpl_scaled.dtype,
+                )
+                candidate = tmpl_scaled @ rot_mat.T  # [N, 2]
+                if do_mirror:
+                    candidate[:, 0] = -candidate[:, 0]
+                candidate = candidate + anchor  # translate to formation_center
+
+                # Hungarian assignment: minimize total squared distance
+                cost = ((pos.unsqueeze(1) - candidate.unsqueeze(0)) ** 2).sum(dim=-1)  # [N, N]
+                cost_np = cost.detach().cpu().numpy()
+                row_idx, col_idx = linear_sum_assignment(cost_np)
+                total_cost = cost_np[row_idx, col_idx].sum()
+                if total_cost < best_cost:
+                    best_cost = total_cost
+                    best_targets = candidate
+                    best_col_idx = col_idx
+
+        col_idx_t = torch.from_numpy(np.array(best_col_idx)).to(
+            device=best_targets.device, dtype=torch.long
+        )
+        self._target_per_agent[env_index] = best_targets[col_idx_t]
+        # Set prev_target_dist as final state for this env (审稿修正 #5)
+        self._prev_target_dist[env_index] = (
+            pos - self._target_per_agent[env_index]
+        ).norm(dim=-1)
 
     def reset_world_at(self, env_index: Optional[int] = None):
         # VMAS may call reset_world_at(None) to reset all envs at once. We implement that
@@ -307,6 +384,10 @@ class Scenario(BaseScenario):
                 torch.empty((1,), device=self.world.device, dtype=torch.float32).uniform_(-math.pi, math.pi),
                 batch_index=env_index,
             )
+
+        # Per-agent target assignment (after spawn + heading are finalized)
+        if self.target_progress_w > 0.0:
+            self._assign_targets_for_env(env_index)
 
         self._rew_per_agent = None
         self._shared_rew = None
@@ -579,6 +660,21 @@ class Scenario(BaseScenario):
                     - self.safe_action_w * action_cost
                     + self.success_bonus * success_mask
                 )
+                # Per-agent target progress reward (potential-based shaping)
+                if self.target_progress_w > 0.0 and self._target_per_agent is not None:
+                    cur_target_dist = (pos - self._target_per_agent).norm(dim=-1)  # [B, N]
+                    valid_prev = self._prev_target_dist >= 0.0  # [B, N]
+                    target_progress = torch.where(
+                        valid_prev,
+                        self._prev_target_dist - cur_target_dist,
+                        torch.zeros_like(cur_target_dist),
+                    )  # [B, N]
+                    self._prev_target_dist = cur_target_dist.clone()
+                    target_arrived = (cur_target_dist < self.target_success_radius).float()
+                    per_agent = per_agent + (
+                        self.target_progress_w * target_progress
+                        + self.target_success_bonus * target_arrived
+                    )
             elif self.share_reward:
                 if self.progress_reward:
                     if self._prev_struct_loss is None:
@@ -683,6 +779,9 @@ class Scenario(BaseScenario):
                 global_shape_progress_mean=shape_progress,
             )
             self._info_cache["spacing_loss"] = spacing_loss
+            if self.target_progress_w > 0.0 and self._target_per_agent is not None:
+                self._info_cache["target_dist_mean"] = cur_target_dist.mean(dim=-1)
+                self._info_cache["target_arrived_frac"] = target_arrived.mean(dim=-1)
 
             if self.share_reward and not self.mixed_reward:
                 self._shared_rew = per_agent.mean(dim=-1)  # [B]
@@ -970,12 +1069,19 @@ class Scenario(BaseScenario):
                 local_geom_features_n,      # [6] 局部角色/边界形状特征
             ], dim=-1)  # Total dim / 总维度：9 + K*4
 
-        # 6. Optional: include goal-relative observation (position relative to formation center)
+        # 6. Optional: include goal-relative observation.
+        # When target assignment is active, points toward agent's assigned target;
+        # otherwise falls back to formation_center.
         if self.obs_include_goal_rel:
-            # Position relative to formation center (world frame)
             pos_world = agent.state.pos  # [B, 2]
-            goal_rel_world = self.formation_center.unsqueeze(0) - pos_world  # [B, 2]
-            
+            if self.target_progress_w > 0.0 and self._target_per_agent is not None:
+                # Per-agent target from assignment
+                target_world = self._target_per_agent[:, idx, :]  # [B, 2]
+                goal_rel_world = target_world - pos_world  # [B, 2]
+            else:
+                # Legacy: relative to formation center
+                goal_rel_world = self.formation_center.unsqueeze(0) - pos_world  # [B, 2]
+
             # Convert to body frame
             rot = agent.state.rot  # [B, 1]
             cos_theta = torch.cos(rot).squeeze(-1)  # [B]
@@ -983,23 +1089,23 @@ class Scenario(BaseScenario):
             goal_rel_x_body = cos_theta * goal_rel_world[:, 0] + sin_theta * goal_rel_world[:, 1]
             goal_rel_y_body = -sin_theta * goal_rel_world[:, 0] + cos_theta * goal_rel_world[:, 1]
             goal_rel_body = torch.stack([goal_rel_x_body, goal_rel_y_body], dim=-1)  # [B, 2]
-            
-            # Distance and angle to center
+
+            # Distance and heading error
             goal_dist = goal_rel_world.norm(dim=-1, keepdim=True)  # [B, 1]
             goal_angle = torch.atan2(goal_rel_world[:, 1], goal_rel_world[:, 0]).unsqueeze(-1)  # [B, 1]
-            heading_error = goal_angle - rot  # [B, 1] angle to center relative to agent heading
-            heading_error = torch.atan2(torch.sin(heading_error), torch.cos(heading_error))  # normalize to [-pi, pi]
-            
-            # Normalize goal-relative features
+            heading_error = goal_angle - rot  # [B, 1]
+            heading_error = torch.atan2(torch.sin(heading_error), torch.cos(heading_error))
+
+            # Normalize
             if self.normalize_obs:
                 goal_rel_body_n = goal_rel_body / max(self.world_semidim, 1e-8)
                 goal_dist_n = goal_dist / max(self.world_semidim, 1e-8)
-                heading_error_n = heading_error / math.pi  # normalize to [-1, 1]
+                heading_error_n = heading_error / math.pi
             else:
                 goal_rel_body_n = goal_rel_body
                 goal_dist_n = goal_dist
                 heading_error_n = heading_error
-            
+
             goal_features = torch.cat([goal_rel_body_n, goal_dist_n, heading_error_n], dim=-1)  # [B, 4]
             obs = torch.cat([obs, goal_features], dim=-1)
 

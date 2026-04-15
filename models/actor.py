@@ -123,6 +123,9 @@ class _GatedMessagePassingLayer(nn.Module):
             nn.Tanh(),
             nn.Linear(inner_dim, state_dim),
         )
+        # Post-residual LayerNorm: keeps message-passing output statistics stable across
+        # rapid weight updates, so downstream fc_out sees a non-drifting input distribution.
+        self.norm = nn.LayerNorm(state_dim)
 
     def forward(
         self,
@@ -141,7 +144,7 @@ class _GatedMessagePassingLayer(nn.Module):
         degree = edge_mask.sum(dim=-1, keepdim=True)
         degree_norm = degree / max(n_agents - 1, 1)
         delta = torch.tanh(self.update_mlp(torch.cat([h, agg, degree_norm], dim=-1)))
-        return h + delta
+        return self.norm(h + delta)
 
 
 class GNNActor(ActorBase):
@@ -177,11 +180,15 @@ class GNNActor(ActorBase):
                 for _ in range(int(gnn_layers))
             ]
         )
-        # Small initial coupling keeps the warm-started baseline policy intact while the GNN learns
-        # a useful spatial correction on top.
+        # Per-feature residual gate: shape [hidden] instead of scalar.
+        # Lets PPO selectively keep useful GNN feature dimensions while damping noisy ones,
+        # rather than collapsing the GNN contribution as a single global scalar.
         init = float(gnn_residual_init)
         init = min(max(init, 1e-4), 1.0 - 1e-4)
-        self.residual_alpha_logit = nn.Parameter(torch.tensor(math.log(init / (1.0 - init)), dtype=torch.float32))
+        init_logit = math.log(init / (1.0 - init))
+        self.residual_alpha_logit = nn.Parameter(
+            torch.full((hidden,), init_logit, dtype=torch.float32)
+        )
         if recurrent:
             self.gru_cell = nn.GRUCell(hidden, hidden)
             self.fc_out = nn.Linear(hidden, n_actions)

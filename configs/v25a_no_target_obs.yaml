@@ -1,0 +1,101 @@
+# v25a: Remove target_rel from obs, keep target_progress in reward only
+#
+# Key insight: v24a's target_rel in obs is global information (GPS waypoint).
+# GNN has no real role when agents know exactly where to go.
+# This version removes target_rel from obs so agents must learn direction
+# purely from GNN neighbor messages + reward trial-and-error.
+#
+# Change from v24a: obs-include-goal-rel: true -> false
+# This drops obs_dim from 6 to 2 (only vel_body remains).
+# Reward target_progress is unchanged — still per-agent dense signal.
+#
+# Expected: much slower training (5000+ updates vs v24a's 800).
+# If this works, GNN is truly earning its role.
+# If not, need stronger reward design (per-agent role reward, plan 3).
+
+device: cuda
+num-envs: 128
+n-agents: 30
+max-episode-steps: 1000
+
+rollout-steps: 256
+total-updates: 5000
+
+actor-hidden: 256
+critic-hidden: 512
+recurrent: true
+chunk-len: 16
+gnn: true
+gnn-hidden: 64
+gnn-layers: 2
+gnn-residual-init: 0.5
+gnn-radius: 0.085
+gnn-top-k: 8
+gnn-obs-self-only: true
+
+lr-actor: 3.0e-4
+lr-critic: 3.0e-4
+gamma: 0.99
+gae-lambda: 0.95
+clip-coef: 0.2
+ent-coef: 0.02
+ent-coef-end: 0.005
+ent-decay-updates: 600
+vf-coef: 1.0
+max-grad-norm: 0.5
+update-epochs: 4
+minibatch-size-policy: 2048
+minibatch-size-value: 2048
+value-clip: 0.2
+amp: false
+amp-dtype: bf16
+torch-compile: false
+lr-end-factor: 0.1
+
+# Per-agent target assignment (reward only, NOT in obs)
+target-progress-w: 50.0
+target-success-radius-mm: 33.0
+target-success-bonus: 0.0
+
+# Existing rewards (same as v24a)
+formation-w: 0.5
+formation-sinkhorn-tau: 0.001
+formation-sinkhorn-iters: 30
+formation-eps: 1.0e-8
+formation-template-seed: 0
+target-spacing-mm: 45.0
+spacing-w: 0.3
+boundary-spacing-scale: 0.3
+spacing-ratio-lo: 0.85
+spacing-ratio-hi: 1.15
+triangle-w: 0.1
+boundary-frac: 0.35
+corner-peak-ratio: 1.15
+triangle-shape-w-tri: 0.45
+triangle-shape-w-corner: 0.30
+triangle-shape-w-straight: 0.25
+lattice-w: 0.1
+reward-schedule-update: 0
+formation-w-late: 1.5
+spacing-w-late: 0.5
+lattice-w-late: 0.5
+lattice-k: 6
+per-agent-reward: true
+mixed-reward: true
+progress-reward: false
+success-bonus: 0.0
+success-threshold: 0.05
+safe-collision-w: 0.5
+safe-action-w: 0.0
+
+normalize-obs: true
+obs-top-k-neighbors: 8
+obs-include-goal-rel: false    # ← KEY CHANGE: no target_rel in obs
+fast-collisions: false
+
+seed: 0
+deterministic: false
+log-every: 10
+save-every: 100
+out-dir: runs/triangle_fill_v25a_no_target_obs
+tensorboard: true

@@ -231,6 +231,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--success-threshold", type=float, default=0.05)
     p.add_argument("--safe-collision-w", type=float, default=0.5)
     p.add_argument("--safe-action-w", type=float, default=0.02)
+    # Per-agent target assignment (potential-based shaping toward assigned template positions).
+    p.add_argument("--target-progress-w", type=float, default=0.0,
+                    help="Weight for per-agent target progress reward. 0 disables target assignment.")
+    p.add_argument("--target-success-radius-mm", type=float, default=33.0)
+    p.add_argument("--target-success-bonus", type=float, default=0.0)
     # Environment/scenario knobs (for scientific ablations; passed into Scenario.make_world via make_env kwargs).
     # If you don't set these, the scenario defaults are used.
     p.add_argument("--pile-center-x-mm", type=float, default=None)
@@ -301,7 +306,17 @@ def parse_args() -> argparse.Namespace:
 
 
 class Critic(nn.Module):
-    """CTDE critic: DeepSets over per-agent state + global scale."""
+    """CTDE per-agent critic.
+
+    Outputs V_i(s) for each agent. Combines centralized global features
+    (mean+max DeepSets pool over all agents + log_rms scale) with each
+    agent's own per-agent features.
+
+    Why per-agent: in mixed_reward, agent_i's reward has agent-specific
+    components (spacing, lattice, collision). A team-mean baseline cannot
+    explain that variance, so per-agent advantage is dominated by noise.
+    A per-agent V_i(s) gives a tight per-agent baseline.
+    """
 
     def __init__(self, per_agent_dim: int, hidden: int):
         super().__init__()
@@ -311,8 +326,10 @@ class Critic(nn.Module):
             nn.Linear(hidden // 2, hidden // 2),
             nn.Tanh(),
         )
+        # Per-agent value head: concat [own phi, mean phi, max phi, log_rms]
+        # = (hidden//2) * 3 + 1
         self.rho = nn.Sequential(
-            nn.Linear(hidden + 1, hidden),
+            nn.Linear(3 * (hidden // 2) + 1, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
@@ -320,11 +337,20 @@ class Critic(nn.Module):
         )
 
     def forward(self, agent_features: torch.Tensor, log_rms: torch.Tensor) -> torch.Tensor:
-        phi_out = self.phi(agent_features)
-        mean_p = phi_out.mean(dim=-2)
-        max_p = phi_out.max(dim=-2).values
-        pooled = torch.cat([mean_p, max_p, log_rms.unsqueeze(-1)], dim=-1)
-        return self.rho(pooled).squeeze(-1)
+        # agent_features: [..., N, per_agent_dim]
+        # log_rms:        [...]   (one scalar per env)
+        # returns:        [..., N]
+        phi_out = self.phi(agent_features)  # [..., N, hidden//2]
+        mean_p = phi_out.mean(dim=-2, keepdim=True)  # [..., 1, hidden//2]
+        max_p = phi_out.max(dim=-2, keepdim=True).values  # [..., 1, hidden//2]
+        n = phi_out.shape[-2]
+        mean_exp = mean_p.expand(*phi_out.shape[:-1], -1)  # [..., N, hidden//2]
+        max_exp = max_p.expand(*phi_out.shape[:-1], -1)  # [..., N, hidden//2]
+        log_rms_exp = log_rms.unsqueeze(-1).unsqueeze(-1).expand(
+            *phi_out.shape[:-1], 1
+        )  # [..., N, 1]
+        per_agent = torch.cat([phi_out, mean_exp, max_exp, log_rms_exp], dim=-1)
+        return self.rho(per_agent).squeeze(-1)  # [..., N]
 
 
 def build_critic_input(env_agents, v0: float) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -407,6 +433,8 @@ def metric_keys_for_training() -> List[str]:
         "action_mean",
         "sinkhorn_entropy",
         "speed_mean",
+        "target_dist_mean",
+        "target_arrived_frac",
     ]
 
 
@@ -606,6 +634,9 @@ def main() -> None:
         "success_threshold": float(args.success_threshold),
         "safe_collision_w": float(args.safe_collision_w),
         "safe_action_w": float(args.safe_action_w),
+        "target_progress_w": float(args.target_progress_w),
+        "target_success_radius_mm": float(args.target_success_radius_mm),
+        "target_success_bonus": float(args.target_success_bonus),
         "torch_compile": bool(args.torch_compile),
         "fast_collisions": bool(args.fast_collisions),
     }
@@ -837,8 +868,9 @@ def main() -> None:
     logp_buf = torch.empty((T, B, n_agents), device=env.device)
     rew_buf = torch.empty((T, B, n_agents), device=env.device)
     done_buf = torch.empty((T, B), device=env.device, dtype=torch.bool)
-    val_buf = torch.empty((T, B), device=env.device)
-    trunc_val_buf = torch.empty((T, B), device=env.device)
+    # Per-agent value buffers (critic outputs V_i(s) for each agent now)
+    val_buf = torch.empty((T, B, n_agents), device=env.device)
+    trunc_val_buf = torch.empty((T, B, n_agents), device=env.device)
     feat_buf = torch.empty((T, B, n_agents, 5), device=env.device)
     lrms_buf = torch.empty((T, B), device=env.device)
     pos_buf = None
@@ -910,7 +942,8 @@ def main() -> None:
             if torch.any(dones):
                 with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
                     trunc_feat, trunc_lrms = build_critic_input(env.agents, scenario.v0)
-                    trunc_val_buf[t] = critic(trunc_feat, trunc_lrms) * dones.float()
+                    # critic now returns [B, N]; dones is [B], broadcast over agents
+                    trunc_val_buf[t] = critic(trunc_feat, trunc_lrms) * dones.float().unsqueeze(-1)
                 if args.recurrent:
                     hx = zero_done_hidden(hx, dones, B, n_agents)
 
@@ -924,28 +957,24 @@ def main() -> None:
 
         with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_autocast, dtype=amp_dtype):
             feat_last, lrms_last = build_critic_input(env.agents, scenario.v0)
-            last_value = critic(feat_last, lrms_last)
-            val_buf_n = val_buf.unsqueeze(-1).expand(T, B, n_agents)
-            last_value_n = last_value.unsqueeze(-1).expand(B, n_agents)
-            trunc_val_buf_n = trunc_val_buf.unsqueeze(-1).expand(T, B, n_agents)
+            last_value = critic(feat_last, lrms_last)  # [B, N]
             done_buf_n = done_buf.unsqueeze(-1).expand(T, B, n_agents)
             adv, ret = compute_gae(
-                rew_buf,
-                done_buf_n,
-                val_buf_n,
-                last_value_n,
+                rew_buf,        # [T, B, N]
+                done_buf_n,     # [T, B, N]
+                val_buf,        # [T, B, N] (per-agent now)
+                last_value,     # [B, N] (per-agent now)
                 args.gamma,
                 args.gae_lambda,
-                trunc_values=trunc_val_buf_n,
+                trunc_values=trunc_val_buf,  # [T, B, N] (per-agent now)
             )
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # Flatten value batch: (T,B)
+        # Flatten value batch: (T*B, ...) — critic now per-agent so ret/val are [T*B, N]
         global_feat_flat = feat_buf.reshape(T * B, n_agents, 5)
         global_lrms_flat = lrms_buf.reshape(T * B)
-        ret_for_critic = ret.mean(dim=-1)
-        ret_flat = ret_for_critic.reshape(T * B)
-        old_val_flat = val_buf.reshape(T * B)
+        ret_flat = ret.reshape(T * B, n_agents)
+        old_val_flat = val_buf.reshape(T * B, n_agents)
 
         obs_graph_flat = obs_buf.reshape(T * B, n_agents, obs_dim)
         pos_graph_flat = pos_buf.reshape(T * B, n_agents, 2) if pos_buf is not None else None
@@ -1177,7 +1206,15 @@ def main() -> None:
                 writer.add_scalar("train/steps_per_second", T * B / max(total_time, 1e-6), update)
                 writer.add_scalar("train/env_steps_per_second", T * B / max(rollout_time, 1e-6), update)
 
-            cur_score = float(metric_mean.get("formation_score", float("-inf")))
+            # Best-checkpoint selection.
+            # ckpt_best_score: shape-aware composite (formation quality + triangle shape - penalties).
+            # ckpt_best_loss: still tracks raw shape_loss as a shape-only diagnostic.
+            cur_score = (
+                float(metric_mean.get("formation_score", 0.0))
+                + 0.5 * float(metric_mean.get("triangle_shape_score", 0.0))
+                - 0.5 * float(metric_mean.get("spacing_loss", 0.0))
+                - 0.5 * float(metric_mean.get("collision_mean", 0.0))
+            )
             cur_loss = float(metric_mean.get("formation_loss", float("inf")))
 
             if cur_score > best_formation_score:
@@ -1195,7 +1232,7 @@ def main() -> None:
                     scaler_critic=scaler_critic,
                 )
                 save_checkpoint(out_dir / "ckpt_best_score.pt", payload)
-                print(f"saved best score checkpoint at update={update} formation_score={best_formation_score:.3f}")
+                print(f"saved best score checkpoint at update={update} composite_score={best_formation_score:+.4f}")
 
             if cur_loss < best_formation_loss:
                 best_formation_loss = cur_loss
