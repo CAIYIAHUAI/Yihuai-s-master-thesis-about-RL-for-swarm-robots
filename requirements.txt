@@ -1,0 +1,10 @@
+# Tested with Python 3.10 on Linux (CUDA 12.8 build of PyTorch).
+# For torch / torch-geometric, follow the official wheel instructions if your
+# CUDA + Torch combination needs a specific index URL.
+numpy==2.2.6
+scipy==1.15.3
+pyyaml==6.0.3
+matplotlib==3.10.8
+pytest==9.0.2
+torch==2.10.0
+torch-geometric==2.7.0

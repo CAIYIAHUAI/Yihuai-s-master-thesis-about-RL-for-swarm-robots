@@ -1,0 +1,9 @@
+# "Without distance matrix" ablation — N=10 multi-shape.
+#
+# Identical to configs/n10_all_shapes.yaml EXCEPT the robots' edge feature
+# drops d_desired (the target-shape distance-matrix entry). edge_dim_selfshape: 13
+# = 9 geometry + 4 raw z_src, with NO d_desired. The hand-coded teacher still
+# computes labels from slot_pair_dist, so the teacher keeps the distances; only the
+# robots are no longer given them directly.
+extends: ../../configs/n10_all_shapes.yaml
+edge_dim_selfshape: 13

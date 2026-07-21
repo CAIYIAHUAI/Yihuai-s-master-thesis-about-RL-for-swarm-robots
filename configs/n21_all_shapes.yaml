@@ -1,0 +1,25 @@
+extends: n10_all_shapes.yaml
+
+# Fixed-local self-shape config, N=21.
+# One model trained on ALL formations for this team size (triangle, hexagon,
+# rectangular grid, AND the large ring), with stress_norm=fixed_n_minus_1 (the
+# main-method setting). Evaluated per-formation. The large ring is included so
+# its failure is measured by the same model that forms the other shapes, with no
+# pool/normalization/model confound.
+n_agents: 21
+robot_init_jitter: 0.030
+node_dim_selfshape: 33              # v18e: 8 base + 4 latent_z + 21 slot one-hot
+actor_type: gat
+
+comm_radius: 0.180                  # fixed real-robot locality constraint
+episode_length: 600
+total_updates: 800
+
+shape_pool: [t6, hex21, ring21, row7x3]   # ring INCLUDED in training
+stress_norm: fixed_n_minus_1              # SAME as main method (not active_neighbors)
+
+envs: 8
+
+# ring21 is ~unsolvable under fixed local comm and drags the aggregate loose
+# succ down; lower the floor so an otherwise-good checkpoint is not rejected.
+ckpt_score_loose_floor: 0.01

@@ -1,0 +1,172 @@
+# swarm_formation / 10-agent T4 mean-shift formation
+#
+# All time/length scales are explicit. Values must satisfy the invariants
+# checked in observations.py::assert_time_scales:
+#   forward_step  == v_max * dt
+#   rotate_step   == angle_threshold_far
+#   r_claim       <  arrival_radius < r_release
+#   density_radius >= 2 * kernel_sigma
+#   comm_radius    >= 2 * density_radius
+#   forward_step  <  0.5 * arrival_radius   (else enable crossing detection)
+
+# ----- task ------------------------------------------------------------------
+n_agents: 10                          # T4 = 1+2+3+4
+target_spacing: 0.045                 # d
+target_center_mode: random_disc
+target_offset_max: 0.135              # 3 * target_spacing = target_sense_radius
+target_theta_random: true
+target_theta: 0.0                     # fallback when target_theta_random=false
+
+# ----- initialization --------------------------------------------------------
+robot_init_mode: origin_jitter
+robot_init_jitter: 0.015              # small fixed-origin spawn jitter
+
+# ----- time / motion ---------------------------------------------------------
+dt: 1.0
+v_max: 0.006
+forward_step: 0.006                   # = v_max * dt
+rotate_step: 0.52                     # rad/step (= angle_threshold_far)
+
+# ----- mean-shift expert -----------------------------------------------------
+v_ms: 0.006                           # density-gradient speed cap
+v_guidance: 0.005                     # shape-centroid pull when Q_i empty
+v_collision: 0.008                    # repulsion speed cap
+v_escape: 0.005                       # blocked exploration speed
+expert_velocity_noise: 0.0006         # symmetry-break noise std (per axis)
+
+arrival_radius: 0.0135                # r_arrive
+kernel_sigma: 0.03375                 # σ for density Gaussian
+density_radius: 0.0675                # m: density-contribution cutoff (in `m_{j,k}`)
+target_sense_radius: 0.135            # robot's per-step target sensing radius (defines Q_i)
+comm_radius: 0.180                    # robot-robot message radius (R6: 4d, > T4 diameter 3d)
+density_sharpness: 3.0                # share^p exponent in v_rho competitive weight
+density_hop_penalty: 1.0              # blocked-direction multiplier on density weight
+
+r_claim:   0.0090                     # < arrival_radius
+r_release: 0.0180                     # > arrival_radius
+claim_steps: 8                        # steps in r_claim to reach full claim
+claim_decay: 0.5                      # per-step decay between claim/release
+claim_boost: 1.5                      # multiplier on density when claimed
+
+collision_radius: 0.0225              # 0.5 d, soft repulsion onset
+collision_hard:   0.0090              # ~0.2 d, hard repulsion (capped)
+collision_gain:   1.5
+
+# blocked / escape / hop
+blocked_speed_threshold: 0.0015       # below this for `blocked_steps_threshold` steps
+blocked_steps_threshold: 6
+hop_max: 6
+
+# ----- velocity -> action discretization ------------------------------------
+angle_threshold_far:  0.52            # rad: large-distance threshold (= rotate_step)
+angle_threshold_near: 0.20            # rad: near-target threshold
+angle_blend_dist:     0.0270          # 2 * arrival_radius for threshold blending
+label_margin:         0.10            # rad band around threshold → ambiguous label
+ambiguous_label_weight: 0.3
+min_move_speed:       0.0015          # below: STOP candidate / no velocity aux
+collision_risk_radius: 0.0225         # neighbor closer than this counts as risk
+
+# ----- model -----------------------------------------------------------------
+node_dim: 43                          # = NODE_FEATURE_DIM in observations.py (19 base + 6*4 targets), legacy/target mode
+edge_dim: 9                           # = EDGE_FEATURE_DIM in observations.py, legacy/target mode
+node_dim_selfshape: 22                # v18e: 8 base + 4 latent_z + 10 slot one-hot (dead/target dims pruned)
+action_mode: continuous               # v16: "continuous" — actor outputs Normal(mu, std) over (linear, angular) ∈ [-1,1]²
+                                       # "discrete" (legacy) — Categorical(4) over STOP/LEFT/RIGHT/FORWARD
+action_log_std_init: -1.9              # v16b: log(0.15) — tighter exploration than v16's -0.69 (std=0.5)
+                                       # which kept actor uncommitted and prevented PPO convergence.
+action_log_std_min: -4.0               # v16c: post-step soft clamp [-4.0, -1.7] → std ∈ [0.018, 0.183]
+action_log_std_max: -1.7               # v16b -1.5 (std=0.223) was hit late-stage and saturated actions.
+                                       # Tighter bound prevents Normal entropy maximization from inflating std.
+continuous_stop_lin_eps: 0.05          # v16b: |linear| < eps AND |angular| < eps → STOP
+continuous_stop_ang_eps: 0.05          # (v16 used linear<0.3 which mislabeled rotate-in-place / micro-adjust)
+edge_dim_selfshape: 14                # v17b': = EDGE_FEATURE_DIM_SELFSHAPE (9 geom + 4 raw z_src + 1 d_desired)
+gat_hidden: 128
+gat_heads: 4
+gru_hidden: 256
+top_m_targets: 6                      # node feature: top-M visible targets
+critic_hidden: 128
+latent_z_dim: 4                       # per-episode persistent latent (R1)
+
+# ----- MAPPO -----------------------------------------------------------------
+seed: 1
+device: cuda
+envs: 16
+rollout_steps: 200
+episode_length: 300
+chunk_len: 20
+ppo_epochs: 2                          # v17c: 4 → 2 (less overfitting on BC-warm policy)
+minibatches: 4
+gamma: 0.99
+gae_lambda: 0.95
+clip: 0.10                             # v17c: 0.2 → 0.10 (tighter trust-region around BC behavior)
+value_clip: 0.2
+ent_coef_start: 0.0
+ent_coef_end:   0.0
+lr_actor:  1.0e-4                      # v17c: 3e-4 → 1e-4 (gentle fine-tune; PPO must not destroy BC)
+lr_critic: 3.0e-4                      # critic can still learn fast (it's brand new)
+max_grad_norm: 1.0
+total_updates: 500
+
+
+success_matching_distance: 0.4         # × d at end-of-episode (used by env diagnostic)
+
+# ----- self-shape mode (R1-R17) ---------------------------------------------
+success_shape_distance: 0.4            # × d, LOOSE threshold (back-compat)
+success_shape_distance_strict: 0.25    # v9 FIX #5: STRICT threshold (visual T4) — also reported in eval
+shape_match_theta_bins: 72             # rotation grid for shape_match_distance_grid
+bond_length_ratios: [1.0, 1.732050808, 2.0, 2.645751311, 3.0]  # {d, √3 d, 2d, √7 d, 3d} (R2)
+
+# v18d reward weights: stress potential (main signal) + base safety terms.
+reward_weights_selfshape:
+  collision:           0.2
+  connectivity:        0.5
+  stress_env:          1.0   # env-scalar -V(p)/(N-1) potential reward, strictly local
+  stress_per_agent:    0.5   # per-agent local stress contribution (PPO credit assignment)
+  linear_action_cost:  0.10  # squared-magnitude penalty on linear action
+  angular_action_cost: 0.05  # squared-magnitude penalty on angular action
+  premature_stop:      0.0   # disabled — STOP semantics replaced by stress gradient
+  complete:            0.0   # v9-era completion bonus; v18d uses stress for shaping
+
+# Checkpoint selection mode for best_eval.pt (used by main_selfshape ckpt scorer).
+ckpt_score_mode: v11
+ckpt_score_loose_floor: 0.30    # minimum succ@0.4d for ckpt to be selectable
+
+# v9 FIX #6+#18: per-step proxy threshold. Calibration: perfect T4 profile≈0,
+# typical training/eval profile 0.10-0.15. v5/v8 used 0.05 → NEVER fired →
+# premature_stop penalty always-on → actor learned a0=0. v9: 0.15 fires when
+# actor is in a "good-enough near-T4" state.
+success_shape_profile_threshold: 0.15
+
+# v5 ROLLBACK: STOP-bias didn't actually keep a0 from collapsing in v2/v3/v4.
+# The bond_w (which forces agents to keep moving toward T4-spacing edges) is more
+# determinative. Set to 0.
+stop_action_bias_warmstart: 0.0
+
+# v17c Curriculum: BC actor was trained at cue=0 (pure self-shape obs schema).
+# PPO must NOT bring back cue/target features — that's a different obs distribution
+# than the actor was BC-trained on. So skip warmup, start at s=1, target_w=0.
+curriculum:
+  T_warmup: 0                          # v17c: skip warmup; BC actor is already in self-shape regime
+  T_total:  1                          # v17c: s_raw=update/T_total → s=1 from update 1 → cue=0 immediately
+                                        # (preserves BC's cue=0 obs schema; PPO doesn't see target_map)
+  cue_anneal_exp: 1.5
+  shape_w_end:    0.0                  # v17c: profile-aux off (BC already shapes)
+  target_w_start: 0.0                  # v17c: 5.0 → 0.0 (no legacy target reward at all)
+  kl_old_start:   1.0
+  kl_old_end:     0.05
+  # v8b: lift s_max to 1.0 — with v8's per-agent reward providing strong
+  # asymmetric gradient signal, pure self-shape (cue=0) should now be trainable.
+  s_max: 1.0
+  # v10: re-enable self-paced freeze. With s_max=1.0 and new reward function,
+  # actor needs safety net if eval succ drops badly during cue anneal.
+  # Triggers freeze when rolling eval succ drops to <65% of peak; resumes anneal
+  # when recovers to ≥85%.
+  self_paced_window: 3
+  self_paced_drop_frac: 0.0            # v11: 关掉 freeze。v10 卡 s=0.12 没真正进 cue=0 regime。
+                                        # 必须强制 cue 退火到 0，eval 掉就让它掉。
+  self_paced_recover_frac: 0.85
+  self_paced_base:  0.10               # unused under relative-to-peak design
+  self_paced_slope: 0.10
+
+# Connectivity penalty (R6b: per-agent local, not global)
+connectivity_min_neighbors: 1          # agent triggers penalty if neighbor count < this

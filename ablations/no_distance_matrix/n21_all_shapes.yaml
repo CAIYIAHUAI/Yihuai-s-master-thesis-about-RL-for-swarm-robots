@@ -1,0 +1,7 @@
+# "Without distance matrix" ablation — N=21 ring-clean.
+#
+# Identical to configs/n21_all_shapes.yaml EXCEPT the robots' edge feature
+# drops d_desired (the target-shape distance-matrix entry). edge_dim_selfshape: 13
+# = 9 geometry + 4 raw z_src, with NO d_desired. The teacher keeps the distances.
+extends: ../../configs/n21_all_shapes.yaml
+edge_dim_selfshape: 13

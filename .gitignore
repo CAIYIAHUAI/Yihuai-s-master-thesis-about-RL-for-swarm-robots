@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[co]
+.pytest_cache/
+.mypy_cache/
+.coverage
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Experiment outputs — results are intentionally not part of this repository.
+# Re-running the scripts recreates everything under runs/.
+runs/
+*.pt
+*.log
+*.mp4
+*.gif
+*.png
+*.pdf
+ablations/no_distance_matrix/RESULTS.md
+ablations/no_distance_matrix/eval_no_dmatrix.txt
+
+# Local-only material (thesis text, figures, archived one-off scripts)
+*.tex
+paper_figures/
+archive_local/
